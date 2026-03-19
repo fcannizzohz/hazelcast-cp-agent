@@ -20,7 +20,7 @@ services:
     hostname: mcp-prometheus
     restart: unless-stopped
     environment:
-      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://host.docker.internal:9090}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://localhost:9090}
       PORT: "8001"
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -20,7 +20,7 @@ Log access backend is selected via LOG_BACKEND:
 
 Environment:
   HZ_MEMBERS   comma-separated member names  default: hz1,hz2,hz3,hz4,hz5
-  MC_URL       Management Center base URL    default: http://management-center:8080
+  MC_URL       Management Center base URL    default: http://host.docker.internal:8080
   MC_CLUSTER   Hazelcast cluster name        default: dev
   PORT         HTTP port                     default: 8002
   LOG_BACKEND  docker | files | none         default: docker
@@ -50,7 +50,7 @@ from starlette.routing import Mount, Route
 
 PORT        = int(os.environ.get("PORT", "8002"))
 MEMBERS     = [m.strip() for m in os.environ.get("HZ_MEMBERS", "hz1,hz2,hz3,hz4,hz5").split(",")]
-MC_URL      = os.environ.get("MC_URL",      "http://management-center:8080").rstrip("/")
+MC_URL      = os.environ.get("MC_URL",      "http://host.docker.internal:8080").rstrip("/")
 MC_CLUSTER  = os.environ.get("MC_CLUSTER",  "dev")
 LOG_BACKEND = os.environ.get("LOG_BACKEND", "docker").lower()   # docker | files | none
 LOG_DIR     = os.environ.get("LOG_DIR",     "/logs")

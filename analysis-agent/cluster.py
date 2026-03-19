@@ -8,7 +8,7 @@ Group roles cannot be inferred from metrics alone, so they always come from
 STATIC_CONTEXT.
 
 Environment:
-  MC_URL      Management Center base URL  default: http://management-center:8080
+  MC_URL      Management Center base URL  default: http://host.docker.internal:8080
   MC_CLUSTER  Hazelcast cluster name      default: dev
 """
 
@@ -24,7 +24,7 @@ import httpx
 
 from prom import PrometheusClient
 
-MC_URL          = os.environ.get("MC_URL",          "http://management-center:8080").rstrip("/")
+MC_URL          = os.environ.get("MC_URL",          "http://host.docker.internal:8080").rstrip("/")
 MC_CLUSTER      = os.environ.get("MC_CLUSTER",      "dev")
 # Comma-separated host:port addresses used for the Hazelcast REST health check.
 # These must be HTTP-reachable from inside the agent container (e.g. host.docker.internal:5701).

@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+
+import httpx
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -27,7 +29,9 @@ from llm import AVAILABLE_MODELS, analyse
 from prom import PrometheusClient, choose_step
 from queries import INSTANT_QUERIES, RANGE_QUERIES
 
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
+PROMETHEUS_URL  = os.environ.get("PROMETHEUS_URL",  "http://localhost:9090")
+PROM_MCP_URL    = os.environ.get("MCP_SERVER_URL",  "http://localhost:8001")
+HZ_MCP_URL      = os.environ.get("MCP_HZ_URL",      "http://localhost:8002")
 
 app = FastAPI(title="CP Subsystem AI Agent")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -72,16 +76,60 @@ async def models():
 
 @app.get("/api/config")
 async def config():
-    return {"prometheus_url": PROMETHEUS_URL}
+    from cluster import MC_URL
+    return {
+        "prometheus_url": PROMETHEUS_URL,
+        "mc_url":         MC_URL,
+        "prom_mcp_url":   PROM_MCP_URL,
+        "hz_mcp_url":     HZ_MCP_URL,
+    }
 
 
 @app.get("/api/health")
 async def health(
     prometheus_url: Annotated[str, Query()] = PROMETHEUS_URL,
+    mc_url:         Annotated[str, Query()] = "",
 ):
-    prom = PrometheusClient(prometheus_url)
-    ok = await prom.health()
-    return {"prometheus": ok, "prometheus_url": prometheus_url}
+    """
+    Checks all dependencies from the server side using the URLs the agent
+    actually uses. The browser never reaches backend services directly.
+    """
+    from cluster import MC_URL as DEFAULT_MC_URL
+
+    async def _check_url(url: str) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(url)
+            if r.status_code < 500:
+                return {"ok": True,  "message": "Connected"}
+            return {"ok": False, "message": f"HTTP {r.status_code}"}
+        except httpx.ConnectError:
+            return {"ok": False, "message": "Connection refused"}
+        except httpx.TimeoutException:
+            return {"ok": False, "message": "Timed out"}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    async def _check_prometheus(url: str) -> dict:
+        try:
+            ok = await PrometheusClient(url).health()
+            return {"ok": ok, "message": "Connected" if ok else "Unreachable"}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    resolved_mc = mc_url or DEFAULT_MC_URL
+    prometheus, management_center, prom_mcp, hz_mcp = await asyncio.gather(
+        _check_prometheus(prometheus_url),
+        _check_url(resolved_mc),
+        _check_url(f"{PROM_MCP_URL}/health"),
+        _check_url(f"{HZ_MCP_URL}/health"),
+    )
+    return {
+        "prometheus":        prometheus,
+        "management_center": management_center,
+        "prom_mcp":          prom_mcp,
+        "hz_mcp":            hz_mcp,
+    }
 
 
 @app.get("/api/analyse")
