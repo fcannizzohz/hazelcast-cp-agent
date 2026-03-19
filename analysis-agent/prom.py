@@ -1,25 +1,62 @@
-"""Async Prometheus HTTP API client."""
+"""
+Prometheus clients.
+
+PrometheusClient — direct HTTP client used only for health checks.
+PromMcpClient    — calls prom-mcp-server REST endpoints; used for all
+                   analysis queries so that a single tool implementation
+                   serves both the analysis pipeline and the LLM chat agent.
+"""
 
 import httpx
 
 
 class PrometheusClient:
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    """Thin direct client — kept for health checks only."""
+
+    def __init__(self, base_url: str, timeout: float = 5.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
+    async def health(self) -> bool:
+        """Return True if Prometheus is reachable."""
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.get(f"{self.base_url}/-/healthy")
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+class PromMcpClient:
+    """
+    Calls prom-mcp-server REST endpoints for instant and range queries.
+
+    Parameters
+    ----------
+    mcp_url      : base URL of prom-mcp-server (e.g. http://mcp-prometheus:8001)
+    prometheus_url: Prometheus URL to forward to the MCP server per-request;
+                   when empty the MCP server's own configured URL is used.
+    """
+
+    def __init__(self, mcp_url: str, prometheus_url: str = "", timeout: float = 30.0):
+        self.mcp_url = mcp_url.rstrip("/")
+        self.prometheus_url = prometheus_url
+        self.timeout = timeout
+
+    def _extra(self) -> dict:
+        return {"url": self.prometheus_url} if self.prometheus_url else {}
+
     async def query(self, promql: str, timestamp: float | None = None) -> list[dict]:
         """Instant query — returns a list of {metric, value} dicts."""
-        params: dict = {"query": promql}
+        params: dict = {"query": promql, **self._extra()}
         if timestamp is not None:
             params["time"] = timestamp
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(f"{self.base_url}/api/v1/query", params=params)
-            r.raise_for_status()
+            r = await client.get(f"{self.mcp_url}/query", params=params)
         data = r.json()
-        if data["status"] != "success":
-            raise RuntimeError(f"Prometheus query failed: {data}")
-        return data["data"]["result"]
+        if r.status_code >= 400 or isinstance(data, dict) and "error" in data:
+            raise RuntimeError(data.get("error", f"HTTP {r.status_code}"))
+        return data
 
     async def query_range(
         self,
@@ -29,40 +66,13 @@ class PrometheusClient:
         step: str,
     ) -> list[dict]:
         """Range query — returns a list of {metric, values} dicts."""
-        params = {"query": promql, "start": start, "end": end, "step": step}
+        params = {"query": promql, "start": start, "end": end, "step": step, **self._extra()}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/query_range", params=params
-            )
-            r.raise_for_status()
+            r = await client.get(f"{self.mcp_url}/query_range", params=params)
         data = r.json()
-        if data["status"] != "success":
-            raise RuntimeError(f"Prometheus range query failed: {data}")
-        return data["data"]["result"]
-
-    async def label_values(self, label: str, match: str | None = None) -> list[str]:
-        """Return all values for a label (e.g. __name__ for metric discovery)."""
-        params: dict = {}
-        if match:
-            params["match[]"] = match
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/label/{label}/values", params=params
-            )
-            r.raise_for_status()
-        data = r.json()
-        if data["status"] != "success":
-            raise RuntimeError(f"Prometheus label_values failed: {data}")
-        return sorted(data.get("data", []))
-
-    async def health(self) -> bool:
-        """Return True if Prometheus is reachable."""
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.get(f"{self.base_url}/-/healthy")
-            return r.status_code == 200
-        except Exception:
-            return False
+        if r.status_code >= 400 or isinstance(data, dict) and "error" in data:
+            raise RuntimeError(data.get("error", f"HTTP {r.status_code}"))
+        return data
 
 
 def choose_step(duration_seconds: float) -> str:

@@ -17,15 +17,20 @@ An AI-powered SRE analysis stack for Hazelcast CP subsystem health monitoring. I
 ```
 Browser
   └── analysis-agent :8000  (FastAPI + web UI)
-        ├── prom-mcp-server :8001  (Prometheus MCP tools)
+        ├── prom-mcp-server :8001  (Prometheus MCP tools + REST query API)
         └── hz-mcp-server   :8002  (Hazelcast config + log MCP tools)
 
-analysis-agent ──HTTP──► Prometheus       (host.docker.internal:9090)
-analysis-agent ──HTTP──► Management Center (host.docker.internal:8080)
-hz-mcp-server  ──socket─► Docker daemon   (for log and config file access)
+analysis-agent ──REST──► prom-mcp-server ──HTTP──► Prometheus       (host.docker.internal:9090)
+analysis-agent ──REST──► hz-mcp-server   ──HTTP──► Management Center (host.docker.internal:8080)
+LLM (chat)     ──MCP───► prom-mcp-server
+LLM (chat)     ──MCP───► hz-mcp-server   ──socket─► Docker daemon   (for log and config file access)
 ```
 
 All three services share an internal Docker bridge network (`agent-net`). The agent reaches your cluster over `host.docker.internal` — no shared network with the cluster containers is required.
+
+All Prometheus query logic lives in `prom-mcp-server` and is shared between both access paths:
+- **Analysis pipeline** calls the MCP server's REST endpoints directly (`/query`, `/query_range`) — no LLM involved.
+- **Chat agent** calls the same logic as MCP tools via the SSE transport, invoked by the LLM.
 
 ---
 
@@ -181,13 +186,26 @@ FastAPI application. Serves the web UI and two streaming SSE endpoints:
 
 ### prom-mcp-server (`:8001`)
 
-MCP server exposing three Prometheus tools:
+Prometheus query server. Exposes the same query logic over two transports:
+
+**MCP tools** (used by the LLM during chat):
 
 | Tool | Description |
 |---|---|
 | `prometheus_query` | Instant PromQL query |
 | `prometheus_query_range` | Range PromQL query |
 | `prometheus_list_metrics` | List available metrics (optional prefix filter) |
+
+**REST endpoints** (used by the analysis pipeline directly):
+
+| Endpoint | Description |
+|---|---|
+| `GET /query?query=&time=&url=` | Instant PromQL query |
+| `GET /query_range?query=&start=&end=&step=&url=` | Range PromQL query |
+| `GET /metrics?prefix=&url=` | List available metrics |
+| `POST /config` | Update runtime `prometheus_url` |
+
+The optional `url=` parameter overrides the server's configured Prometheus URL for that request, allowing the UI to target a different Prometheus instance without restarting.
 
 ### hz-mcp-server (`:8002`)
 

@@ -27,7 +27,7 @@ from analysis import build_context, summarise_instant, summarise_range
 from chat import chat_stream
 from cluster import derive_context
 from llm import AVAILABLE_MODELS, analyse
-from prom import PrometheusClient, choose_step
+from prom import PrometheusClient, PromMcpClient, choose_step
 from queries import INSTANT_QUERIES, RANGE_QUERIES
 
 load_dotenv()
@@ -119,6 +119,14 @@ async def update_config(request: Request):
         except Exception:
             pass  # MCP server unreachable; UI will show red dot
 
+    # Propagate prometheus_url to prom-mcp-server
+    if body.get("prometheus_url"):
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                await client.post(f"{PROM_MCP_URL}/config", json={"prometheus_url": body["prometheus_url"]})
+        except Exception:
+            pass
+
     return {"ok": True, "config": {k: _cfg[k] for k in _cfg}}
 
 
@@ -200,7 +208,7 @@ async def analyse_endpoint(
     """
 
     async def event_stream():
-        prom = PrometheusClient(prometheus_url)
+        prom = PromMcpClient(PROM_MCP_URL, prometheus_url=prometheus_url)
         duration = end - start
         step = choose_step(duration)
 

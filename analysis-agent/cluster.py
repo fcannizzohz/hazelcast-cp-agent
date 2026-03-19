@@ -21,7 +21,7 @@ import os
 import httpx
 from dotenv import load_dotenv
 
-from prom import PrometheusClient
+from prom import PromMcpClient
 
 load_dotenv()
 
@@ -99,7 +99,7 @@ async def _fetch_cluster_health(members: list[str], hz_member_addrs: str = "") -
 # ---------------------------------------------------------------------------
 
 async def derive_context(
-    prom: PrometheusClient,
+    prom: PromMcpClient,
     *,
     hz_member_addrs: str = "",
 ) -> dict:

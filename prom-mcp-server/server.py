@@ -22,13 +22,16 @@ from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 load_dotenv()
 
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090").rstrip("/")
 PORT = int(os.environ.get("PORT", "8001"))
+
+# Runtime override — updated via POST /config
+_cfg: dict = {}
 
 app = Server("prometheus-mcp")
 
@@ -140,12 +143,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # Prometheus helpers
 # ---------------------------------------------------------------------------
 
-async def _query(promql: str, timestamp=None) -> list:
+def _prom_url() -> str:
+    return (_cfg.get("prometheus_url") or PROMETHEUS_URL).rstrip("/")
+
+
+async def _query(promql: str, timestamp=None, prom_url: str = "") -> list:
+    url = (prom_url or _prom_url()).rstrip("/")
     params: dict = {"query": promql}
     if timestamp is not None:
         params["time"] = timestamp
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{PROMETHEUS_URL}/api/v1/query", params=params)
+        r = await client.get(f"{url}/api/v1/query", params=params)
         r.raise_for_status()
     data = r.json()
     if data["status"] != "success":
@@ -153,10 +161,11 @@ async def _query(promql: str, timestamp=None) -> list:
     return data["data"]["result"]
 
 
-async def _query_range(promql: str, start: float, end: float, step: str) -> list:
+async def _query_range(promql: str, start: float, end: float, step: str, prom_url: str = "") -> list:
+    url = (prom_url or _prom_url()).rstrip("/")
     params = {"query": promql, "start": start, "end": end, "step": step}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{PROMETHEUS_URL}/api/v1/query_range", params=params)
+        r = await client.get(f"{url}/api/v1/query_range", params=params)
         r.raise_for_status()
     data = r.json()
     if data["status"] != "success":
@@ -164,14 +173,15 @@ async def _query_range(promql: str, start: float, end: float, step: str) -> list
     return data["data"]["result"]
 
 
-async def _list_metrics(prefix: str) -> list[str]:
+async def _list_metrics(prefix: str, prom_url: str = "") -> list[str]:
     # Fetch all metric names; filter in Python.
     # Note: the match[] selector is intentionally omitted — constructing
     # {__name__=~"..."} in an f-string is error-prone and the full name list
     # is small enough (~hundreds of metrics) that server-side filtering adds
     # no meaningful benefit.
+    url = (prom_url or _prom_url()).rstrip("/")
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{PROMETHEUS_URL}/api/v1/label/__name__/values")
+        r = await client.get(f"{url}/api/v1/label/__name__/values")
         r.raise_for_status()
     data = r.json()
     if data["status"] != "success":
@@ -180,6 +190,54 @@ async def _list_metrics(prefix: str) -> list[str]:
     if prefix:
         names = [n for n in names if n.startswith(prefix)]
     return names
+
+
+# ---------------------------------------------------------------------------
+# REST endpoints — used by analysis-agent for direct (non-LLM) tool access
+# ---------------------------------------------------------------------------
+
+async def handle_query(request: Request) -> Response:
+    promql = request.query_params.get("query", "")
+    t = request.query_params.get("time")
+    prom_url = request.query_params.get("url", "")
+    try:
+        result = await _query(promql, float(t) if t else None, prom_url=prom_url)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def handle_query_range(request: Request) -> Response:
+    p = request.query_params
+    prom_url = p.get("url", "")
+    try:
+        result = await _query_range(
+            p.get("query", ""),
+            float(p["start"]),
+            float(p["end"]),
+            p["step"],
+            prom_url=prom_url,
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def handle_list_metrics(request: Request) -> Response:
+    prefix = request.query_params.get("prefix", "")
+    prom_url = request.query_params.get("url", "")
+    try:
+        result = await _list_metrics(prefix, prom_url=prom_url)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def handle_config(request: Request) -> Response:
+    body = await request.json()
+    if "prometheus_url" in body and body["prometheus_url"]:
+        _cfg["prometheus_url"] = body["prometheus_url"]
+    return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +266,11 @@ starlette_app = Starlette(
     routes=[
         Route("/sse", endpoint=handle_sse),
         Mount("/messages", app=sse_transport.handle_post_message),
-        Route("/health", endpoint=lambda r: Response("ok")),
+        Route("/health", endpoint=lambda _: Response("ok")),
+        Route("/query", endpoint=handle_query),
+        Route("/query_range", endpoint=handle_query_range),
+        Route("/metrics", endpoint=handle_list_metrics),
+        Route("/config", endpoint=handle_config, methods=["POST"]),
     ]
 )
 
