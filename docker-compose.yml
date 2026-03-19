@@ -1,0 +1,70 @@
+version: "3.8"
+
+# ── Networks ───────────────────────────────────────────────────────────────────
+# agent-net   : internal network — the three agent services discover each other here.
+# cluster-net : external Docker network created by the Hazelcast cluster stack.
+#               Set CLUSTER_NETWORK in .env to match whatever network your cluster
+#               compose project uses (default: cpsubsystem-ops_hz-net).
+#               The agent services join this network so they can reach Prometheus,
+#               Management Center, and the HZ member containers by hostname.
+
+networks:
+  agent-net:
+    driver: bridge
+  cluster-net:
+    external: true
+    name: ${CLUSTER_NETWORK:-cpsubsystem-ops_hz-net}
+
+# ── Services ───────────────────────────────────────────────────────────────────
+
+services:
+
+  mcp-prometheus:
+    build: ./prom-mcp-server
+    container_name: mcp-prometheus
+    hostname: mcp-prometheus
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      PORT: "8001"
+    networks:
+      - agent-net
+      - cluster-net
+
+  mcp-hazelcast:
+    build: ./hz-mcp-server
+    container_name: mcp-hazelcast
+    hostname: mcp-hazelcast
+    restart: unless-stopped
+    environment:
+      HZ_MEMBERS:  ${HZ_MEMBERS:-hz1,hz2,hz3,hz4,hz5}
+      MC_URL:      ${MC_URL:-http://management-center:8080}
+      MC_CLUSTER:  ${MC_CLUSTER:-dev}
+      PORT:        "8002"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - agent-net
+      - cluster-net
+
+  analysis-agent:
+    build: ./analysis-agent
+    container_name: analysis-agent
+    hostname: analysis-agent
+    restart: unless-stopped
+    ports:
+      - "${AGENT_PORT:-8000}:8000"
+    environment:
+      PROMETHEUS_URL:   ${PROMETHEUS_URL:-http://prometheus:9090}
+      MCP_SERVER_URL:   "http://mcp-prometheus:8001"
+      MCP_HZ_URL:       "http://mcp-hazelcast:8002"
+      MC_URL:           ${MC_URL:-http://management-center:8080}
+      MC_CLUSTER:       ${MC_CLUSTER:-dev}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+    networks:
+      - agent-net
+      - cluster-net
+    depends_on:
+      - mcp-prometheus
+      - mcp-hazelcast

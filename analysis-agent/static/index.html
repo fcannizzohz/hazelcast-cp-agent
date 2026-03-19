@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>CP Subsystem AI Analysis</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3a;
+      --accent:    #5b8af5;
+      --accent-h:  #7aa3ff;
+      --text:      #e2e4ed;
+      --muted:     #7a7f96;
+      --ok:        #3fb950;
+      --warn:      #d29922;
+      --crit:      #f85149;
+      --radius:    8px;
+      --font:      'Inter', system-ui, sans-serif;
+      --mono:      'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.6;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ──────────────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 15px; font-weight: 600; letter-spacing: .02em; }
+    #prom-status {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #prom-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    #prom-dot.ok   { background: var(--ok); }
+    #prom-dot.fail { background: var(--crit); }
+
+    /* ── Two-column layout ────────────────────────────────────────────── */
+    #layout {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────── */
+    #sidebar {
+      width: 420px;
+      flex-shrink: 0;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      border-right: 1px solid var(--border);
+    }
+
+    /* ── Main content ────────────────────────────────────────────────── */
+    #content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* ── Shared panel ────────────────────────────────────────────────── */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; font-weight: 600; letter-spacing: .04em; }
+
+    /* ── Presets ─────────────────────────────────────────────────────── */
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-bottom: 10px;
+    }
+    .preset-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 5px;
+      padding: 3px 9px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .preset-btn:hover   { border-color: var(--accent); color: var(--accent-h); }
+    .preset-btn.active  { border-color: var(--accent); background: #1a2d54; color: var(--accent-h); }
+
+    /* ── Inputs ──────────────────────────────────────────────────────── */
+    .datetime-row { display: flex; gap: 6px; }
+    .datetime-row input {
+      flex: 1; min-width: 0;
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text);
+      padding: 6px 8px;
+      font-size: 12px;
+      font-family: var(--mono);
+      outline: none;
+    }
+    .datetime-row input:focus { border-color: var(--accent); }
+
+    select, .text-input {
+      width: 100%;
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text);
+      padding: 7px 9px;
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus, .text-input:focus { border-color: var(--accent); }
+    select option { background: var(--surface); }
+    .text-input { font-family: var(--mono); font-size: 12px; }
+    textarea.text-input { resize: vertical; }
+
+    /* ── Analyse button ──────────────────────────────────────────────── */
+    .actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+    #analyse-btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, opacity .15s;
+      white-space: nowrap;
+    }
+    #analyse-btn:hover    { background: var(--accent-h); }
+    #analyse-btn:disabled { opacity: .5; cursor: not-allowed; }
+    #status-msg { font-size: 12px; color: var(--muted); }
+
+    /* ── Operator context ────────────────────────────────────────────── */
+    .context-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 7px 9px;
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      margin-bottom: 5px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .context-item .context-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+    .context-remove {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 0;
+      flex-shrink: 0;
+    }
+    .context-remove:hover { color: var(--crit); }
+    .context-empty { font-size: 12px; color: var(--muted); text-align: center; padding: 8px 0; }
+
+    /* ── Results ─────────────────────────────────────────────────────── */
+    #results {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+    }
+    #results.visible { display: block; }
+
+    .result-meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+    }
+
+    .warning-box {
+      background: #2a1f0a;
+      border: 1px solid #5a3f0a;
+      border-radius: 5px;
+      padding: 7px 11px;
+      font-size: 12px;
+      color: var(--warn);
+      margin-bottom: 10px;
+    }
+
+    /* ── Chat ────────────────────────────────────────────────────────── */
+    #chat-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      z-index: 999;
+    }
+    #chat-overlay.visible { display: block; }
+
+    #chat-section {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    #chat-section.visible { display: flex; flex-direction: column; }
+
+    #chat-section.maximized {
+      position: fixed;
+      inset: 50px;
+      z-index: 1000;
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+    }
+    #chat-section.maximized #chat-messages {
+      flex: 1;
+      max-height: none;
+    }
+
+    #chat-header {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #chat-header .mcp-badge {
+      font-size: 10px;
+      padding: 1px 7px;
+      border-radius: 100px;
+      background: #1a2d1a;
+      color: #3fb950;
+      border: 1px solid #2a4a2a;
+    }
+    #chat-maximize-btn {
+      margin-left: auto;
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 2px;
+      display: flex;
+      align-items: center;
+      border-radius: 4px;
+      transition: color .15s, background .15s;
+    }
+    #chat-maximize-btn:hover { color: var(--text); background: var(--border); }
+
+    #chat-messages {
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-height: 480px;
+      overflow-y: auto;
+    }
+
+    .chat-msg {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-width: 88%;
+    }
+    .chat-msg.user   { align-self: flex-end; align-items: flex-end; }
+    .chat-msg.assistant { align-self: flex-start; align-items: flex-start; }
+
+    .chat-bubble {
+      padding: 9px 13px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+    .chat-msg.user .chat-bubble {
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+    .chat-msg.assistant .chat-bubble {
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 3px;
+      color: var(--text);
+    }
+    /* Markdown inside assistant bubbles */
+    .chat-bubble h2, .chat-bubble h3 { font-weight: 600; margin: 8px 0 4px; }
+    .chat-bubble p  { margin: 4px 0; }
+    .chat-bubble ul, .chat-bubble ol { padding-left: 18px; margin: 4px 0; }
+    .chat-bubble li { margin: 2px 0; }
+    .chat-bubble strong { color: #fff; }
+    .chat-bubble code {
+      font-family: var(--mono); font-size: 11px;
+      background: #0f1117; padding: 1px 4px; border-radius: 3px;
+    }
+    .chat-bubble table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 12px; }
+    .chat-bubble th { background: #0f1117; padding: 5px 10px; text-align: left; border: 1px solid var(--border); color: var(--muted); font-weight: 600; }
+    .chat-bubble td { padding: 5px 10px; border: 1px solid var(--border); }
+
+    .tool-call-pill {
+      font-size: 11px;
+      color: #3fb950;
+      background: #0f1f0f;
+      border: 1px solid #1a3a1a;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-family: var(--mono);
+      align-self: flex-start;
+    }
+
+    #chat-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+    }
+    #chat-input {
+      flex: 1;
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 8px 11px;
+      font-size: 13px;
+      font-family: var(--font);
+      outline: none;
+      resize: none;
+    }
+    #chat-input:focus { border-color: var(--accent); }
+    #chat-send {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, opacity .15s;
+      white-space: nowrap;
+      align-self: flex-end;
+    }
+    #chat-send:hover    { background: var(--accent-h); }
+    #chat-send:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* ── Markdown output ─────────────────────────────────────────────── */
+    #md-output.streaming {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.75;
+      color: var(--text);
+    }
+    #md-output.streaming::after {
+      content: '▋';
+      animation: blink .7s step-end infinite;
+      color: var(--accent);
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    #md-output { font-size: 13px; line-height: 1.7; color: var(--text); }
+    #md-output h2 {
+      font-size: 15px; font-weight: 700; color: var(--accent-h);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px; margin: 22px 0 10px;
+    }
+    #md-output h2:first-child { margin-top: 0; }
+    #md-output h3 { font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
+    #md-output p  { margin: 6px 0; }
+    #md-output ul, #md-output ol { padding-left: 20px; margin: 6px 0; }
+    #md-output li { margin: 3px 0; }
+    #md-output strong { color: #fff; }
+    #md-output code {
+      font-family: var(--mono); font-size: 12px;
+      background: #12151f; padding: 1px 5px; border-radius: 4px;
+    }
+    #md-output table {
+      border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px;
+    }
+    #md-output th {
+      background: #12151f; padding: 7px 12px; text-align: left;
+      border: 1px solid var(--border); color: var(--muted); font-weight: 600;
+    }
+    #md-output td { padding: 7px 12px; border: 1px solid var(--border); }
+    #md-output tr:nth-child(even) td { background: #13161f; }
+  </style>
+</head>
+<body>
+
+<header>
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#5b8af5;flex-shrink:0"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+  <h1>CP Subsystem AI Analysis</h1>
+  <div id="prom-status">
+    <div id="prom-dot"></div>
+    <span id="prom-label">Prometheus</span>
+  </div>
+</header>
+
+<div id="chat-overlay"></div>
+<div id="layout">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+  <aside id="sidebar">
+
+    <!-- Config panel -->
+    <div class="panel">
+      <div style="margin-bottom:14px">
+        <label>TIME RANGE</label>
+        <div class="presets" id="presets">
+          <button class="preset-btn" data-m="15">15 m</button>
+          <button class="preset-btn" data-m="30">30 m</button>
+          <button class="preset-btn active" data-m="60">1 h</button>
+          <button class="preset-btn" data-m="180">3 h</button>
+          <button class="preset-btn" data-m="360">6 h</button>
+          <button class="preset-btn" data-m="720">12 h</button>
+          <button class="preset-btn" data-m="1440">24 h</button>
+        </div>
+        <label>CUSTOM RANGE</label>
+        <div class="datetime-row">
+          <input type="datetime-local" id="start-input" title="Start" />
+          <input type="datetime-local" id="end-input"   title="End"   />
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label>MODEL</label>
+        <select id="model-select">
+          <option value="">Loading models…</option>
+        </select>
+      </div>
+
+      <div class="actions">
+        <button id="analyse-btn">Analyse</button>
+        <span id="status-msg"></span>
+      </div>
+    </div>
+
+    <!-- Operator context panel -->
+    <div class="panel">
+      <label>OPERATOR CONTEXT</label>
+      <div style="font-size:11px;color:var(--muted);margin:3px 0 10px;line-height:1.5">
+        Injected into the prompt. Ctrl+Enter to add.
+      </div>
+      <div id="context-items"></div>
+      <div style="display:flex;gap:7px;margin-top:8px;align-items:flex-start">
+        <textarea id="context-input" class="text-input"
+                  placeholder="e.g. Deployment rolled out 2h ago"
+                  rows="2"></textarea>
+        <button id="context-add-btn" class="preset-btn" style="white-space:nowrap;padding:7px 12px">Add</button>
+      </div>
+    </div>
+
+    <!-- Chat section — shown after analysis completes -->
+    <div id="chat-section" class="visible">
+      <div id="chat-header">
+        FOLLOW-UP
+        <span class="mcp-badge">MCP · Prometheus tools</span>
+        <button id="chat-maximize-btn" title="Maximize chat">
+          <!-- expand icon -->
+          <svg id="icon-expand" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+            <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+          </svg>
+          <!-- collapse icon, hidden by default -->
+          <svg id="icon-collapse" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+            <polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/>
+            <line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/>
+          </svg>
+        </button>
+      </div>
+      <div id="chat-messages"></div>
+      <div id="chat-input-row">
+        <textarea id="chat-input" rows="2"
+                  placeholder="Ask a follow-up question… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="chat-send">Send</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main content ──────────────────────────────────────────────────── -->
+  <div id="content">
+    <div id="results">
+      <div class="result-meta" id="result-meta"></div>
+      <div id="warnings"></div>
+      <div id="md-output"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Operator context (localStorage) ──────────────────────────────────────
+  const CONTEXT_KEY = 'cp_agent_context';
+  let contextItems = [];
+  try { contextItems = JSON.parse(localStorage.getItem(CONTEXT_KEY) || '[]'); } catch {}
+
+  function saveContext() {
+    localStorage.setItem(CONTEXT_KEY, JSON.stringify(contextItems));
+  }
+
+  function renderContext() {
+    const el = document.getElementById('context-items');
+    if (!contextItems.length) {
+      el.innerHTML = '<div class="context-empty">No context added yet.</div>';
+      return;
+    }
+    el.innerHTML = contextItems.map((text, i) => `
+      <div class="context-item">
+        <span class="context-text">${escHtml(text)}</span>
+        <button class="context-remove" data-idx="${i}" title="Remove">×</button>
+      </div>`).join('');
+  }
+
+  document.getElementById('context-items').addEventListener('click', e => {
+    if (e.target.classList.contains('context-remove')) {
+      contextItems.splice(+e.target.dataset.idx, 1);
+      saveContext();
+      renderContext();
+    }
+  });
+
+  function addContextItem() {
+    const input = document.getElementById('context-input');
+    const text  = input.value.trim();
+    if (!text) return;
+    contextItems.push(text);
+    saveContext();
+    renderContext();
+    input.value = '';
+  }
+
+  document.getElementById('context-add-btn').addEventListener('click', addContextItem);
+  document.getElementById('context-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addContextItem();
+  });
+
+  renderContext();
+
+  // ── Utilities ─────────────────────────────────────────────────────────────
+  const toLocalIso = d => {
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Preset buttons ────────────────────────────────────────────────────────
+  function applyPreset(minutes) {
+    const end   = new Date();
+    const start = new Date(end - minutes * 60_000);
+    document.getElementById('start-input').value = toLocalIso(start);
+    document.getElementById('end-input').value   = toLocalIso(end);
+    document.querySelectorAll('.preset-btn').forEach(b => {
+      b.classList.toggle('active', +b.dataset.m === minutes);
+    });
+  }
+
+  document.getElementById('presets').addEventListener('click', e => {
+    if (e.target.classList.contains('preset-btn')) applyPreset(+e.target.dataset.m);
+  });
+  ['start-input', 'end-input'].forEach(id => {
+    document.getElementById(id).addEventListener('change', () => {
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+    });
+  });
+  applyPreset(60);
+
+  // ── Load server config ────────────────────────────────────────────────────
+  let promUrl = '';
+  fetch('/api/config')
+    .then(r => r.json())
+    .then(cfg => { promUrl = cfg.prometheus_url || ''; checkPromHealth(); })
+    .catch(() => {});
+
+  // ── Load models ───────────────────────────────────────────────────────────
+  fetch('/api/models')
+    .then(r => r.json())
+    .then(models => {
+      const sel = document.getElementById('model-select');
+      sel.innerHTML = '';
+      let lastProvider = '';
+      models.forEach(m => {
+        if (m.provider !== lastProvider) {
+          const og = document.createElement('optgroup');
+          og.label = m.provider === 'anthropic' ? 'Anthropic' : 'OpenAI';
+          sel.appendChild(og);
+          lastProvider = m.provider;
+        }
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label;
+        if (m.default) opt.selected = true;
+        sel.lastChild.appendChild(opt);
+      });
+    });
+
+  // ── Prometheus health ─────────────────────────────────────────────────────
+  async function checkPromHealth() {
+    try {
+      const r = await fetch('/api/health');
+      const d = await r.json();
+      const dot = document.getElementById('prom-dot');
+      const lbl = document.getElementById('prom-label');
+      if (d.prometheus) {
+        dot.className = 'ok';
+        lbl.textContent = 'Prometheus';
+      } else {
+        dot.className = 'fail';
+        lbl.textContent = 'Prometheus unreachable';
+      }
+    } catch {
+      document.getElementById('prom-dot').className = 'fail';
+    }
+  }
+  setInterval(checkPromHealth, 15_000);
+
+  // ── Analysis ──────────────────────────────────────────────────────────────
+  let activeSource = null;
+
+  document.getElementById('analyse-btn').addEventListener('click', () => {
+    if (activeSource) { activeSource.close(); activeSource = null; }
+
+    const startVal = document.getElementById('start-input').value;
+    const endVal   = document.getElementById('end-input').value;
+    if (!startVal || !endVal) { setStatus('Set a time range first.'); return; }
+
+    const startTs = new Date(startVal).getTime() / 1000;
+    const endTs   = new Date(endVal).getTime() / 1000;
+    if (endTs <= startTs) { setStatus('End must be after start.'); return; }
+
+    const model = document.getElementById('model-select').value;
+    if (!model) { setStatus('Select a model.'); return; }
+
+    const btn      = document.getElementById('analyse-btn');
+    const results  = document.getElementById('results');
+    const mdOut    = document.getElementById('md-output');
+    const warnings = document.getElementById('warnings');
+    const meta     = document.getElementById('result-meta');
+
+    btn.disabled = true;
+    setStatus('');
+    results.className = 'visible';
+    warnings.innerHTML = '';
+    mdOut.className    = 'streaming';
+    mdOut.textContent  = '';
+
+    const ctxNote = contextItems.length
+      ? `<span>📝 ${contextItems.length} context item${contextItems.length > 1 ? 's' : ''}</span>`
+      : '';
+    meta.innerHTML = `
+      <span>📅 ${new Date(startVal).toLocaleString()} → ${new Date(endVal).toLocaleString()}</span>
+      <span>🤖 ${escHtml(model)}</span>
+      <span>🔗 ${escHtml(promUrl)}</span>
+      ${ctxNote}`;
+
+    let rawText  = '';
+    const ctxParam = contextItems.length
+      ? `&user_context=${encodeURIComponent(JSON.stringify(contextItems))}`
+      : '';
+    const url = `/api/analyse?start=${startTs}&end=${endTs}`
+              + `&model=${encodeURIComponent(model)}`
+              + `&prometheus_url=${encodeURIComponent(promUrl)}`
+              + ctxParam;
+    const src = new EventSource(url);
+    activeSource = src;
+
+    src.onmessage = e => {
+      let chunk; try { chunk = JSON.parse(e.data); } catch { chunk = e.data; }
+      rawText += chunk;
+      mdOut.innerText = rawText;
+    };
+
+    src.addEventListener('status', e => {
+      let msg; try { msg = JSON.parse(e.data); } catch { msg = e.data; }
+      setStatus(msg);
+    });
+
+    src.addEventListener('warning', e => {
+      let msg; try { msg = JSON.parse(e.data); } catch { msg = e.data; }
+      warnings.innerHTML += `<div class="warning-box">⚠️ ${escHtml(msg)}</div>`;
+    });
+
+    src.addEventListener('agent_error', e => {
+      let msg; try { msg = JSON.parse(e.data); } catch { msg = e.data; }
+      warnings.innerHTML += `<div class="warning-box" style="background:#2a0a0a;border-color:#5a0a0a;color:#f85149">🔴 ${escHtml(msg)}</div>`;
+      finish();
+    });
+
+    src.addEventListener('done', () => {
+      mdOut.classList.remove('streaming');
+      mdOut.innerHTML = marked.parse(rawText);
+      // Capture context for follow-up chat
+      analysisText = rawText;
+      analysisMeta = {
+        promUrl: promUrl,
+        model:   model,
+        start:   startTs,
+        end:     endTs,
+      };
+      chatHistory = [];
+      document.getElementById('chat-messages').innerHTML = '';
+      finish();
+    });
+
+    src.onerror = () => { if (src.readyState === EventSource.CLOSED) finish(); };
+
+    function finish() {
+      src.close();
+      activeSource = null;
+      btn.disabled = false;
+      setStatus('');
+      mdOut.classList.remove('streaming');
+    }
+  });
+
+  function setStatus(msg) {
+    document.getElementById('status-msg').textContent = msg;
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
+  let analysisText = '';   // captured after analysis completes
+  let analysisMeta = {};   // {start, end, model, promUrl} for the chat request
+  let chatHistory  = [];   // [{role, content}] sent to /api/chat
+  let chatBusy     = false;
+
+  function appendChatMessage(role, content, isStreaming = false) {
+    const list = document.getElementById('chat-messages');
+    const wrap = document.createElement('div');
+    wrap.className = `chat-msg ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble';
+    if (isStreaming) {
+      bubble.textContent = content;
+    } else {
+      bubble.innerHTML = role === 'assistant' ? marked.parse(content) : escHtml(content);
+    }
+    wrap.appendChild(bubble);
+    list.appendChild(wrap);
+    list.scrollTop = list.scrollHeight;
+    return bubble;
+  }
+
+  function appendToolPill(name, input) {
+    const list = document.getElementById('chat-messages');
+    const pill = document.createElement('div');
+    pill.className = 'tool-call-pill';
+    const queryPreview = input.query
+      ? ` · ${input.query.slice(0, 60)}${input.query.length > 60 ? '…' : ''}`
+      : '';
+    pill.textContent = `⚡ ${name}${queryPreview}`;
+    list.appendChild(pill);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  async function sendChatMessage() {
+    if (chatBusy) return;
+    const input = document.getElementById('chat-input');
+    const text  = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    chatBusy = true;
+    document.getElementById('chat-send').disabled = true;
+
+    // Add user message to UI and history
+    appendChatMessage('user', text);
+    chatHistory.push({ role: 'user', content: text });
+
+    // Placeholder assistant bubble for streaming
+    const bubble = appendChatMessage('assistant', '', true);
+    let rawText = '';
+
+    // Resolve meta from analysis run, or fall back to current UI selections
+    const chatModel   = analysisMeta.model   || document.getElementById('model-select').value;
+    const chatPromUrl = analysisMeta.promUrl || promUrl;
+    const chatStart   = analysisMeta.start   || new Date(document.getElementById('start-input').value).getTime() / 1000;
+    const chatEnd     = analysisMeta.end     || new Date(document.getElementById('end-input').value).getTime()   / 1000;
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages:       chatHistory,
+          analysis:       analysisText,
+          prometheus_url: chatPromUrl,
+          start:          chatStart,
+          end:            chatEnd,
+          model:          chatModel,
+        }),
+      });
+
+      const reader  = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = '';
+      let   curEvent = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE lines
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete last line
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            curEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            let data;
+            try { data = JSON.parse(line.slice(6)); } catch { data = line.slice(6); }
+
+            if (curEvent === 'tool_call') {
+              appendToolPill(data.name, data.input || {});
+              curEvent = '';
+            } else if (curEvent === 'done' || curEvent === 'error') {
+              curEvent = '';
+            } else {
+              // Default: text chunk
+              rawText += data;
+              bubble.textContent = rawText; // streaming plain text
+              document.getElementById('chat-messages').scrollTop =
+                document.getElementById('chat-messages').scrollHeight;
+            }
+          } else if (line === '') {
+            curEvent = '';
+          }
+        }
+      }
+
+      // Render final markdown
+      bubble.innerHTML = marked.parse(rawText);
+      chatHistory.push({ role: 'assistant', content: rawText });
+
+    } catch (err) {
+      bubble.textContent = `Error: ${err.message}`;
+    } finally {
+      chatBusy = false;
+      document.getElementById('chat-send').disabled = false;
+      document.getElementById('chat-messages').scrollTop =
+        document.getElementById('chat-messages').scrollHeight;
+    }
+  }
+
+  document.getElementById('chat-send').addEventListener('click', sendChatMessage);
+  document.getElementById('chat-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+  });
+
+  // ── Chat maximize / minimize ──────────────────────────────────────────────
+  let chatMaximized = false;
+
+  function toggleChatMaximize() {
+    chatMaximized = !chatMaximized;
+    document.getElementById('chat-section').classList.toggle('maximized', chatMaximized);
+    document.getElementById('chat-overlay').classList.toggle('visible', chatMaximized);
+    document.getElementById('icon-expand').style.display   = chatMaximized ? 'none'  : '';
+    document.getElementById('icon-collapse').style.display = chatMaximized ? ''      : 'none';
+    document.getElementById('chat-maximize-btn').title     = chatMaximized ? 'Minimize chat' : 'Maximize chat';
+    // Scroll to bottom after resize
+    const msgs = document.getElementById('chat-messages');
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  document.getElementById('chat-maximize-btn').addEventListener('click', toggleChatMaximize);
+  document.getElementById('chat-overlay').addEventListener('click', toggleChatMaximize);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && chatMaximized) toggleChatMaximize();
+  });
+</script>
+</body>
+</html>
