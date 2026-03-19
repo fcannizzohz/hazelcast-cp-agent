@@ -1,19 +1,14 @@
 version: "3.8"
 
 # ── Networks ───────────────────────────────────────────────────────────────────
-# agent-net   : internal network — the three agent services discover each other here.
-# cluster-net : external Docker network created by the Hazelcast cluster stack.
-#               Set CLUSTER_NETWORK in .env to match whatever network your cluster
-#               compose project uses (default: cpsubsystem-ops_hz-net).
-#               The agent services join this network so they can reach Prometheus,
-#               Management Center, and the HZ member containers by hostname.
+# agent-net: internal bridge — the three agent services discover each other here.
+# All outbound connections to the cluster (Prometheus, Management Center,
+# Hazelcast members) go over HTTP using the addresses configured via .env.
+# No shared Docker network with the cluster stack is required.
 
 networks:
   agent-net:
     driver: bridge
-  cluster-net:
-    external: true
-    name: ${CLUSTER_NETWORK:-cpsubsystem-ops_hz-net}
 
 # ── Services ───────────────────────────────────────────────────────────────────
 
@@ -25,11 +20,12 @@ services:
     hostname: mcp-prometheus
     restart: unless-stopped
     environment:
-      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://host.docker.internal:9090}
       PORT: "8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agent-net
-      - cluster-net
 
   mcp-hazelcast:
     build: ./hz-mcp-server
@@ -38,14 +34,25 @@ services:
     restart: unless-stopped
     environment:
       HZ_MEMBERS:  ${HZ_MEMBERS:-hz1,hz2,hz3,hz4,hz5}
-      MC_URL:      ${MC_URL:-http://management-center:8080}
+      MC_URL:      ${MC_URL:-http://host.docker.internal:8080}
       MC_CLUSTER:  ${MC_CLUSTER:-dev}
       PORT:        "8002"
+      # LOG_BACKEND selects the log source:
+      #   docker  (default) — reads container logs via Docker socket
+      #   files             — reads log files from LOG_DIR (mount below)
+      #   none              — disables all log tools
+      LOG_BACKEND: ${LOG_BACKEND:-docker}
+      LOG_DIR:     ${LOG_DIR:-/logs}
     volumes:
+      # docker backend: mount Docker socket (read-only)
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # files backend: mount a host directory containing {member}.log files
+      # Uncomment and set LOG_DIR_HOST in .env, or override here:
+      # - ${LOG_DIR_HOST:-/dev/null}:/logs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agent-net
-      - cluster-net
 
   analysis-agent:
     build: ./analysis-agent
@@ -55,16 +62,22 @@ services:
     ports:
       - "${AGENT_PORT:-8000}:8000"
     environment:
-      PROMETHEUS_URL:   ${PROMETHEUS_URL:-http://prometheus:9090}
-      MCP_SERVER_URL:   "http://mcp-prometheus:8001"
-      MCP_HZ_URL:       "http://mcp-hazelcast:8002"
-      MC_URL:           ${MC_URL:-http://management-center:8080}
-      MC_CLUSTER:       ${MC_CLUSTER:-dev}
+      PROMETHEUS_URL:    ${PROMETHEUS_URL:-http://host.docker.internal:9090}
+      MCP_SERVER_URL:    "http://mcp-prometheus:8001"
+      MCP_HZ_URL:        "http://mcp-hazelcast:8002"
+      MC_URL:            ${MC_URL:-http://host.docker.internal:8080}
+      MC_CLUSTER:        ${MC_CLUSTER:-dev}
+      # HZ_MEMBER_ADDRS: comma-separated host:port pairs used for the Hazelcast
+      # REST health check (/hazelcast/health). Must be HTTP-reachable from inside
+      # this container. Example for 5 members on the host:
+      #   host.docker.internal:5701,host.docker.internal:5702,...,host.docker.internal:5705
+      HZ_MEMBER_ADDRS:   ${HZ_MEMBER_ADDRS:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agent-net
-      - cluster-net
     depends_on:
       - mcp-prometheus
       - mcp-hazelcast

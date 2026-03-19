@@ -1,7 +1,7 @@
 """
 Agentic follow-up chat backed by two live MCP servers:
-  - prom-mcp-server  (Prometheus tools)   — always connected
-  - hz-mcp-server    (Hazelcast log tools) — connected when MCP_HZ_URL is set
+  - prom-mcp-server  (Prometheus tools)                    — always connected
+  - hz-mcp-server    (member config + optional log tools)  — connected when MCP_HZ_URL is set
 
 Both servers are discovered at runtime via session.list_tools(). Tools are
 merged into a single list forwarded to the LLM; each call is routed back to
@@ -38,8 +38,9 @@ You are an expert SRE assistant for Hazelcast CP Subsystem.
 You have access to:
 1. A completed analysis of the cluster for a specific time window (provided below).
 2. A live Prometheus MCP server — use its tools to dig deeper into any metric.
-3. A live Hazelcast MCP server — use its tools to inspect member logs when the
-   analysis or Prometheus data points to a specific issue on specific members.
+3. A live Hazelcast MCP server — use `hz_get_member_config` to fetch the live
+   member configuration from Management Center when you need to verify or apply
+   actual CP subsystem settings (session TTL, group size, CPMap limits, etc.).
 
 ## Prometheus tool guidance
 - Check the completed analysis first; use Prometheus tools when finer granularity is needed.
@@ -223,7 +224,21 @@ Map: imbalance < 5 min after a restart = normal rebalancing, wait |
 Cross-DC: set higher cp-member-priority on members in the primary DC to keep leaders co-located with clients
 and minimise commit latency. Recommended topology for 7-member groups across 3 DCs: 3 / 3 / 1 split.
 
-## Hazelcast log tool guidance (token-efficient workflow)
+## Hazelcast tool guidance
+
+### hz_get_member_config
+Call when:
+- The analysis references a config-driven threshold and `cp_subsystem_config` was absent or incomplete.
+- The user asks about a specific CP setting (e.g. session TTL, group size, CPMap limits).
+- You need to confirm the actual value before applying an interpretation rule.
+
+Pass only the member name (e.g. `hz1`) or address (e.g. `hz1:5701`). Any live member returns
+the same cluster-wide CP configuration.
+
+### Log tools (hz_log_summary / hz_get_logs / hz_get_diagnostic_logs)
+These tools are available when the log backend is configured (docker or files mode).
+If they are not listed, log access is disabled — do not attempt to call them.
+
 When logs may help (e.g. elections, exceptions, timeout errors):
 
   Step 1 — ALWAYS call `hz_log_summary` first.
@@ -240,6 +255,7 @@ When logs may help (e.g. elections, exceptions, timeout errors):
 
   Step 3 — Only call `hz_get_diagnostic_logs` if the user explicitly asks about
            diagnostics or if step 2 reveals an issue that needs deeper trace.
+           This tool is only available in docker backend mode.
 
 Never fetch logs for all members at once unless `hz_log_summary` shows errors
 on multiple members — this wastes tokens on clean members.

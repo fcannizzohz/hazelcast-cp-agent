@@ -24,8 +24,13 @@ import httpx
 
 from prom import PrometheusClient
 
-MC_URL     = os.environ.get("MC_URL",     "http://management-center:8080").rstrip("/")
-MC_CLUSTER = os.environ.get("MC_CLUSTER", "dev")
+MC_URL          = os.environ.get("MC_URL",          "http://management-center:8080").rstrip("/")
+MC_CLUSTER      = os.environ.get("MC_CLUSTER",      "dev")
+# Comma-separated host:port addresses used for the Hazelcast REST health check.
+# These must be HTTP-reachable from inside the agent container (e.g. host.docker.internal:5701).
+# When empty, the agent derives addresses from cp_members with port 5701 — only works when
+# the agent container shares a Docker network with the cluster.
+HZ_MEMBER_ADDRS = os.environ.get("HZ_MEMBER_ADDRS", "")
 
 # ---------------------------------------------------------------------------
 # Static context — update when cluster topology changes
@@ -89,24 +94,32 @@ def _xml_to_dict(element: ET.Element) -> dict | str | None:
 async def _fetch_cluster_health(members: list[str]) -> dict:
     """
     Call the Hazelcast REST health endpoint on each CP member and return a
-    dict of {member: health_result}.  Unreachable members are recorded as
+    dict of {addr: health_result}.  Unreachable members are recorded as
     {"error": "<reason>"}.
 
-    Endpoint: GET http://<host>:5701/hazelcast/health
+    Endpoint: GET http://<host>:<port>/hazelcast/health
     Response: {"nodeState":"ACTIVE","clusterState":"ACTIVE",
                "clusterSafe":true,"migrationQueueSize":0,"clusterSize":N}
+
+    Addresses are taken from HZ_MEMBER_ADDRS (comma-separated host:port) when set,
+    otherwise constructed from the members list using port 5701.
     """
+    if HZ_MEMBER_ADDRS:
+        addrs = [a.strip() for a in HZ_MEMBER_ADDRS.split(",") if a.strip()]
+    else:
+        addrs = [f"{m.split(':')[0]}:5701" for m in members]
+
     results: dict = {}
     async with httpx.AsyncClient(timeout=3.0) as client:
-        for member in members:
-            host = member.split(":")[0]
-            url  = f"http://{host}:5701/hazelcast/health"
+        for addr in addrs:
+            host, port = addr.rsplit(":", 1) if ":" in addr else (addr, "5701")
+            url = f"http://{host}:{port}/hazelcast/health"
             try:
                 r = await client.get(url)
                 r.raise_for_status()
-                results[member] = r.json()
+                results[addr] = r.json()
             except Exception as exc:
-                results[member] = {"error": str(exc)}
+                results[addr] = {"error": str(exc)}
     return results
 
 
