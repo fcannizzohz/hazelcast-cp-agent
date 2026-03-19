@@ -101,9 +101,11 @@ def member_find_files(
         name_expr = " -o ".join(f"-name '{f}'" for f in filenames)
         cmd = f"find {dirs} \\( {name_expr} \\) -type f 2>/dev/null"
         import docker as _docker
+        print(f"[member_find_files] container={name!r} cmd={cmd!r}", flush=True)
         container = _docker.from_env().containers.get(name)
         result = container.exec_run(cmd, demux=True)
         stdout = (result.output[0] or b"").decode("utf-8", errors="replace").strip()
+        print(f"[member_find_files] exit_code={result.exit_code} stdout={stdout!r}", flush=True)
         return stdout.splitlines() if stdout else []
 
     if FILE_ACCESS_BACKEND == "files":
@@ -129,8 +131,11 @@ def member_read_file(member: str, path: str) -> bytes:
 
     if FILE_ACCESS_BACKEND == "docker":
         import docker as _docker
+        print(f"[member_read_file] container={name!r} path={path!r}", flush=True)
         container = _docker.from_env().containers.get(name)
         result = container.exec_run(f"cat {path}", demux=True)
+        nbytes = len(result.output[0] or b"")
+        print(f"[member_read_file] exit_code={result.exit_code} bytes={nbytes}", flush=True)
         return result.output[0] or b""
 
     if FILE_ACCESS_BACKEND == "files":
@@ -357,6 +362,7 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    print(f"[tool:{name}] called  args={json.dumps(arguments)}", flush=True)
     try:
         if name == "hz_get_member_config":
             result = await _get_member_config(arguments["member"])
@@ -385,6 +391,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except Exception as exc:
         result = {"error": str(exc)}
 
+    has_error = "error" in result
+    summary = result.get("error") or result.get("source") or list(result.keys())
+    print(f"[tool:{name}] {'ERROR' if has_error else 'ok'}  result={summary}", flush=True)
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
@@ -392,48 +401,83 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+_CONFIG_CANDIDATES = [
+    "/opt/hazelcast/config/hazelcast.xml",
+    "/opt/hazelcast/config/hazelcast.yaml",
+    "/opt/hazelcast/config/hazelcast.yml",
+    "/opt/hazelcast/hazelcast.xml",
+    "/data/hazelcast.xml",
+]
+
+
 async def _get_member_config(member: str) -> dict:
     """
     Read hazelcast.xml (or hazelcast.yaml) directly from the member using
     the configured FILE_ACCESS_BACKEND.
+    Tries well-known paths first, then falls back to find.
     """
     name = _member_name(member)
+    print(f"[member_config] member={name!r} backend={FILE_ACCESS_BACKEND} known_members={MEMBERS}", flush=True)
     if name not in MEMBERS:
         return {"error": f"Unknown member: {name}. Available: {MEMBERS}"}
 
-    try:
-        paths = member_find_files(
-            name,
-            ["hazelcast.xml", "hazelcast.yaml", "hazelcast.yml"],
-        )
-    except Exception as exc:
-        return {"error": f"Could not locate config file: {exc}"}
+    # Try well-known paths before falling back to find
+    config_path: str | None = None
+    raw_bytes: bytes = b""
+    for candidate in _CONFIG_CANDIDATES:
+        try:
+            data = member_read_file(name, candidate)
+            if data:
+                config_path = candidate
+                raw_bytes = data
+                print(f"[member_config] found at {candidate!r} ({len(data)} bytes)", flush=True)
+                break
+            else:
+                print(f"[member_config] {candidate!r} → empty (file missing or unreadable)", flush=True)
+        except Exception as exc:
+            print(f"[member_config] {candidate!r} → exception: {exc}", flush=True)
 
-    if not paths:
-        return {
-            "error": "No hazelcast.xml / hazelcast.yaml found. "
-                     "Check the container/file layout or mount a config volume.",
-        }
+    if config_path is None:
+        print(f"[member_config] candidates exhausted, falling back to find", flush=True)
+        try:
+            paths = member_find_files(name, ["hazelcast.xml", "hazelcast.yaml", "hazelcast.yml"])
+            print(f"[member_config] find result: {paths}", flush=True)
+        except Exception as exc:
+            print(f"[member_config] find error: {exc}", flush=True)
+            return {"error": f"Could not locate config file: {exc}"}
+        if not paths:
+            return {
+                "error": "No hazelcast.xml / hazelcast.yaml found. "
+                         "Check the container/file layout or mount a config volume.",
+            }
+        config_path = paths[0]
+        try:
+            raw_bytes = member_read_file(name, config_path)
+            print(f"[member_config] read {len(raw_bytes)} bytes from find result", flush=True)
+        except Exception as exc:
+            print(f"[member_config] read error: {exc}", flush=True)
+            return {"error": f"Could not read {config_path}: {exc}"}
 
-    config_path = paths[0]
-    try:
-        content = member_read_file(name, config_path).decode("utf-8", errors="replace")
-    except Exception as exc:
-        return {"error": f"Could not read {config_path}: {exc}"}
+    content = raw_bytes.decode("utf-8", errors="replace")
 
     if config_path.endswith(".xml"):
         try:
             root = ET.parse(io.BytesIO(content.encode("utf-8"))).getroot()
-            return {
+            result = {
                 "member": name,
                 "source": config_path,
                 "config": _xml_to_dict(root),
             }
+            cp_present = "cp-subsystem" in (result["config"] or {})
+            print(f"[member_config] parsed XML ok  cp-subsystem_present={cp_present}", flush=True)
+            return result
         except ET.ParseError as exc:
+            print(f"[member_config] XML parse error: {exc}", flush=True)
             return {"member": name, "source": config_path,
                     "error": f"XML parse error: {exc}", "raw": content[:2000]}
 
     # YAML — return as raw text; LLM can read it directly
+    print(f"[member_config] returning YAML ({len(content)} chars)", flush=True)
     return {"member": name, "source": config_path, "config_yaml": content}
 
 
@@ -709,13 +753,24 @@ async def handle_status(_: Request):
     })
 
 
+async def handle_member_config(request: Request):
+    """REST shortcut so analysis-agent can populate cp_subsystem_config without MCP."""
+    member = request.path_params["member"]
+    print(f"[REST /member-config] member={member!r}", flush=True)
+    result = await _get_member_config(member)
+    has_error = "error" in result
+    print(f"[REST /member-config] {'ERROR: ' + result['error'] if has_error else 'ok  source=' + str(result.get('source'))}", flush=True)
+    return JSONResponse(result)
+
+
 starlette_app = Starlette(
     routes=[
-        Route("/sse",      endpoint=handle_sse),
-        Mount("/messages", app=sse_transport.handle_post_message),
-        Route("/health",   endpoint=lambda r: Response("ok")),
-        Route("/status",   endpoint=handle_status),
-        Route("/config",   endpoint=handle_config_update, methods=["POST"]),
+        Route("/sse",                       endpoint=handle_sse),
+        Mount("/messages",                  app=sse_transport.handle_post_message),
+        Route("/health",                    endpoint=lambda _: Response("ok")),
+        Route("/status",                    endpoint=handle_status),
+        Route("/config",                    endpoint=handle_config_update, methods=["POST"]),
+        Route("/member-config/{member}",    endpoint=handle_member_config),
     ]
 )
 

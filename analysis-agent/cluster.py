@@ -27,6 +27,7 @@ load_dotenv()
 
 MC_URL          = os.environ.get("MC_URL",          "http://host.docker.internal:8080").rstrip("/")
 MC_CLUSTER      = os.environ.get("MC_CLUSTER",      "dev")
+HZ_MCP_URL      = os.environ.get("MCP_HZ_URL",      "http://localhost:8002").rstrip("/")
 # Comma-separated host:port addresses used for the Hazelcast REST health check.
 # These must be HTTP-reachable from inside the agent container (e.g. host.docker.internal:5701).
 # When empty, the agent derives addresses from cp_members with port 5701 — only works when
@@ -170,6 +171,22 @@ async def derive_context(
             ctx["group_roles"]["cp_map"] = map_groups
     except Exception:
         pass
+
+    # ── CP subsystem config via hz-mcp-server ─────────────────────────────
+    # Calls the /member-config REST endpoint which reads hazelcast.xml directly
+    # from the member container (or mounted file), avoiding any MC API dependency.
+    first_member = ctx["cp_members"][0] if ctx.get("cp_members") else STATIC_CONTEXT["cp_members"][0]
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{HZ_MCP_URL}/member-config/{first_member}")
+            r.raise_for_status()
+        data = r.json()
+        # data["config"] is the full hazelcast dict; extract cp-subsystem section
+        cp_cfg = (data.get("config") or {}).get("cp-subsystem")
+        if cp_cfg:
+            ctx["cp_subsystem_config"] = cp_cfg
+    except Exception:
+        pass  # optional enrichment — analysis proceeds without it
 
     # ── Hazelcast REST health check (all CP members) ──────────────────────
     # Only included when HZ_MEMBER_ADDRS is explicitly configured, or when at
