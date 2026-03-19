@@ -15,6 +15,7 @@ import json
 import os
 
 import httpx
+from dotenv import load_dotenv
 import uvicorn
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -23,6 +24,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
+
+load_dotenv()
 
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090").rstrip("/")
 PORT = int(os.environ.get("PORT", "8001"))

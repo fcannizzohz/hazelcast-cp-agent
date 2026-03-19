@@ -3,28 +3,29 @@ Hazelcast MCP server — HTTP/SSE transport.
 
 Tools (ordered by token cost, cheapest first):
 
-  hz_get_member_config    — live CP config from Management Center (always available)
+  hz_get_member_config    — CP config read directly from the member (container or file)
   hz_log_summary          — per-member WARN/ERROR counts for a time window
                             (~50 tokens; use this first to identify affected members)
   hz_get_logs             — structured, filtered log entries from one or more members
                             (bounded by max_lines; stack traces folded to save tokens)
   hz_get_diagnostic_logs  — keyword-filtered diagnostic log snippets
-                            (docker backend only; only useful if diagnostics are enabled)
 
-Log access backend is selected via LOG_BACKEND:
-  docker  (default) — reads logs via the Docker daemon socket (/var/run/docker.sock);
-                      the socket must be mounted read-only into this container.
-  files             — reads log files from LOG_DIR/{member}.log (or subdirectories);
-                      mount your log directory at LOG_DIR.
-  none              — log tools are not exposed; only hz_get_member_config is available.
+All tools require FILE_ACCESS_BACKEND != "none".
+
+File access backend is selected via FILE_ACCESS_BACKEND:
+  docker  (default) — reads logs and files via the Docker daemon socket
+                      (/var/run/docker.sock); the socket must be mounted read-only.
+  files             — reads from FILE_DIR/{member}/ on the local filesystem;
+                      mount your log/config directory at FILE_DIR.
+  none              — file access disabled; no tools are exposed.
 
 Environment:
-  HZ_MEMBERS   comma-separated member names  default: hz1,hz2,hz3,hz4,hz5
-  MC_URL       Management Center base URL    default: http://host.docker.internal:8080
-  MC_CLUSTER   Hazelcast cluster name        default: dev
-  PORT         HTTP port                     default: 8002
-  LOG_BACKEND  docker | files | none         default: docker
-  LOG_DIR      base directory for log files  default: /logs  (files backend only)
+  HZ_MEMBERS             comma-separated member names  default: hz1,hz2,hz3,hz4,hz5
+  MC_URL                 Management Center base URL    default: http://host.docker.internal:8080
+  MC_CLUSTER             Hazelcast cluster name        default: dev
+  PORT                   HTTP port                     default: 8002
+  FILE_ACCESS_BACKEND    docker | files | none         default: docker
+  FILE_DIR               base directory (files backend) default: /logs
 """
 
 from __future__ import annotations
@@ -36,24 +37,25 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import quote
 
-import httpx
 import uvicorn
+from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
-PORT        = int(os.environ.get("PORT", "8002"))
-MEMBERS     = [m.strip() for m in os.environ.get("HZ_MEMBERS", "hz1,hz2,hz3,hz4,hz5").split(",")]
-MC_URL      = os.environ.get("MC_URL",      "http://host.docker.internal:8080").rstrip("/")
-MC_CLUSTER  = os.environ.get("MC_CLUSTER",  "dev")
-LOG_BACKEND = os.environ.get("LOG_BACKEND", "docker").lower()   # docker | files | none
-LOG_DIR     = os.environ.get("LOG_DIR",     "/logs")
+load_dotenv()
+
+PORT                 = int(os.environ.get("PORT", "8002"))
+MEMBERS              = [m.strip() for m in os.environ.get("HZ_MEMBERS", "hz1,hz2,hz3,hz4,hz5").split(",")]
+MC_URL               = os.environ.get("MC_URL",               "http://host.docker.internal:8080").rstrip("/")
+MC_CLUSTER           = os.environ.get("MC_CLUSTER",           "dev")
+FILE_ACCESS_BACKEND  = os.environ.get("FILE_ACCESS_BACKEND",  "docker").lower()   # docker | files | none
+FILE_DIR             = os.environ.get("FILE_DIR",             "/logs")
 
 # Hazelcast log4j2 line pattern:  "HH:mm:ss.SSS [thread] LEVEL  logger - message"
 _LEVEL_RE   = re.compile(r"\]\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+")
@@ -70,168 +72,134 @@ app = Server("hz-mcp")
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions
+# File access abstraction
 # ---------------------------------------------------------------------------
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    member_list = ", ".join(MEMBERS)
+def _member_name(member: str) -> str:
+    """Strip port suffix: 'hz1:5701' → 'hz1'."""
+    return member.split(":")[0]
 
-    tools = [
-        Tool(
-            name="hz_get_member_config",
-            description=(
-                "Fetch the live Hazelcast configuration for a specific member from "
-                "Management Center and return it as JSON. "
-                "Use this to verify CP subsystem settings: session TTL, "
-                "group size, missing-member auto-removal timeout, CPMap size limits, etc."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "member": {
-                        "type": "string",
-                        "description": (
-                            f"Member to query (e.g. 'hz1' or 'hz1:5701'). "
-                            f"Available: {member_list}"
-                        ),
-                    },
-                },
-                "required": ["member"],
-            },
-        ),
+
+def member_find_files(
+    member: str,
+    filenames: list[str],
+    docker_search_dirs: list[str] | None = None,
+) -> list[str]:
+    """
+    Locate files on/in a member by filename pattern.
+
+    For docker: runs `find` inside the container; docker_search_dirs specifies
+    where to look (defaults to common Hazelcast paths).
+    For files:  globs under FILE_DIR/{member}/ recursively.
+
+    Returns a list of absolute paths (inside container for docker, on host for files).
+    """
+    name = _member_name(member)
+
+    if FILE_ACCESS_BACKEND == "docker":
+        dirs = " ".join(docker_search_dirs or ["/opt/hazelcast", "/data", "/opt/hazelcast/config"])
+        name_expr = " -o ".join(f"-name '{f}'" for f in filenames)
+        cmd = f"find {dirs} \\( {name_expr} \\) -type f 2>/dev/null"
+        import docker as _docker
+        container = _docker.from_env().containers.get(name)
+        result = container.exec_run(cmd, demux=True)
+        stdout = (result.output[0] or b"").decode("utf-8", errors="replace").strip()
+        return stdout.splitlines() if stdout else []
+
+    if FILE_ACCESS_BACKEND == "files":
+        found: list[str] = []
+        base = os.path.join(FILE_DIR, name)
+        for fn in filenames:
+            found.extend(glob.glob(os.path.join(base, "**", fn), recursive=True))
+            found.extend(glob.glob(os.path.join(FILE_DIR, fn.replace("*", f"{name}*"))))
+        # deduplicate while preserving order
+        seen: set[str] = set()
+        return [p for p in found if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
+
+    return []
+
+
+def member_read_file(member: str, path: str) -> bytes:
+    """
+    Read a file from/on a member.
+    For docker: path is inside the container (absolute).
+    For files:  path is a local filesystem path returned by member_find_files.
+    """
+    name = _member_name(member)
+
+    if FILE_ACCESS_BACKEND == "docker":
+        import docker as _docker
+        container = _docker.from_env().containers.get(name)
+        result = container.exec_run(f"cat {path}", demux=True)
+        return result.output[0] or b""
+
+    if FILE_ACCESS_BACKEND == "files":
+        with open(path, "rb") as f:
+            return f.read()
+
+    return b""
+
+
+def member_read_logs(member: str, since: int, until: int) -> bytes:
+    """Read timestamped log bytes from a member for the given time window."""
+    name = _member_name(member)
+
+    if FILE_ACCESS_BACKEND == "docker":
+        import docker as _docker
+        container = _docker.from_env().containers.get(name)
+        return container.logs(since=since, until=until, timestamps=True, stream=False)
+
+    if FILE_ACCESS_BACKEND == "files":
+        return _read_logs_files(name, since, until)
+
+    return b""
+
+
+def _read_logs_files(member: str, since: int, until: int) -> bytes:
+    """
+    Read log content from files under FILE_DIR.
+
+    Searched paths (first match wins, all matching files are merged):
+      {FILE_DIR}/{member}.log
+      {FILE_DIR}/{member}/*.log
+      {FILE_DIR}/{member}*.log
+
+    Lines with Docker-format timestamps (YYYY-MM-DDTHH:MM:SS) are filtered to
+    the [since, until] window.  Lines without timestamps are included as-is.
+    """
+    patterns = [
+        os.path.join(FILE_DIR, f"{member}.log"),
+        os.path.join(FILE_DIR, member, "*.log"),
+        os.path.join(FILE_DIR, f"{member}*.log"),
     ]
+    found: list[str] = []
+    for pattern in patterns:
+        found.extend(glob.glob(pattern))
+    seen: set[str] = set()
+    paths = [p for p in found if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
 
-    if LOG_BACKEND != "none":
-        tools += [
-            Tool(
-                name="hz_log_summary",
-                description=(
-                    "Return per-member WARN and ERROR log line counts for a time window. "
-                    "Very cheap (~50 tokens). Call this FIRST to identify which members have "
-                    "issues before fetching full log lines with hz_get_logs."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "start": {"type": "number", "description": "Window start — Unix timestamp"},
-                        "end":   {"type": "number", "description": "Window end   — Unix timestamp"},
-                    },
-                    "required": ["start", "end"],
-                },
-            ),
-            Tool(
-                name="hz_get_logs",
-                description=(
-                    "Fetch structured log entries from Hazelcast members for a time window. "
-                    f"Available members: {member_list}. "
-                    "Returns compact JSON entries {ts, member, level, logger, msg}. "
-                    "Stack traces are folded to the exception class + first cause line to save tokens. "
-                    "Tips: use hz_log_summary first; specify only affected members; "
-                    "pass keywords from Prometheus findings to filter further."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "start":    {"type": "number",  "description": "Window start — Unix timestamp"},
-                        "end":      {"type": "number",  "description": "Window end   — Unix timestamp"},
-                        "members":  {
-                            "type": "array", "items": {"type": "string"},
-                            "description": f"Members to query (default: all). Available: {member_list}",
-                        },
-                        "level":    {
-                            "type": "string",
-                            "enum": ["WARN", "ERROR", "INFO", "DEBUG"],
-                            "description": "Minimum log level to include (default: WARN)",
-                        },
-                        "keywords": {
-                            "type": "array", "items": {"type": "string"},
-                            "description": "Optional keywords — only lines containing at least one are returned",
-                        },
-                        "max_lines": {
-                            "type": "integer",
-                            "description": "Maximum log entries to return (default: 100, max: 300)",
-                        },
-                    },
-                    "required": ["start", "end"],
-                },
-            ),
-        ]
-
-    if LOG_BACKEND == "docker":
-        tools.append(
-            Tool(
-                name="hz_get_diagnostic_logs",
-                description=(
-                    "Fetch Hazelcast diagnostic log snippets from the container filesystem. "
-                    "Only available if diagnostics are enabled in hazelcast.xml "
-                    "(hazelcast.diagnostics.enabled=true). Returns 'not available' otherwise. "
-                    "Always keyword-filter to avoid returning large files."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "member":   {"type": "string",  "description": f"Target member. One of: {member_list}"},
-                        "start":    {"type": "number",  "description": "Window start — Unix timestamp"},
-                        "end":      {"type": "number",  "description": "Window end   — Unix timestamp"},
-                        "keywords": {
-                            "type": "array", "items": {"type": "string"},
-                            "description": "Keywords to filter diagnostic lines (strongly recommended)",
-                        },
-                        "max_lines": {
-                            "type": "integer",
-                            "description": "Maximum lines to return (default: 100)",
-                        },
-                    },
-                    "required": ["member", "start", "end"],
-                },
-            )
-        )
-
-    return tools
+    lines: list[bytes] = []
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                for raw in f:
+                    text = raw.decode("utf-8", errors="replace")
+                    m = _DOCKER_TS.match(text)
+                    if m:
+                        try:
+                            ts = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+                            if not (since <= ts.timestamp() <= until):
+                                continue
+                        except Exception:
+                            pass
+                    lines.append(raw)
+        except Exception:
+            pass
+    return b"".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Tool execution
-# ---------------------------------------------------------------------------
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    try:
-        if name == "hz_get_member_config":
-            result = await _get_member_config(arguments["member"])
-        elif name == "hz_log_summary":
-            result = await _log_summary(
-                float(arguments["start"]),
-                float(arguments["end"]),
-            )
-        elif name == "hz_get_logs":
-            result = await _get_logs(
-                start    = float(arguments["start"]),
-                end      = float(arguments["end"]),
-                members  = arguments.get("members") or MEMBERS,
-                level    = arguments.get("level", "WARN"),
-                keywords = [k.lower() for k in (arguments.get("keywords") or [])],
-                max_lines= min(int(arguments.get("max_lines") or 100), 300),
-            )
-        elif name == "hz_get_diagnostic_logs":
-            result = await _get_diagnostic_logs(
-                member   = arguments["member"],
-                start    = float(arguments["start"]),
-                end      = float(arguments["end"]),
-                keywords = [k.lower() for k in (arguments.get("keywords") or [])],
-                max_lines= int(arguments.get("max_lines") or 100),
-            )
-        else:
-            result = {"error": f"Unknown tool: {name}"}
-    except Exception as exc:
-        result = {"error": str(exc)}
-
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-# ---------------------------------------------------------------------------
-# Member config helper
+# XML helper
 # ---------------------------------------------------------------------------
 
 def _xml_to_dict(element: ET.Element) -> dict | str | None:
@@ -265,115 +233,208 @@ def _xml_to_dict(element: ET.Element) -> dict | str | None:
     return child_map
 
 
-async def _get_member_config(member: str) -> dict:
-    member_addr = member if ":" in member else f"{member}:5701"
-    url = f"{MC_URL}/api/clusters/{MC_CLUSTER}/members/{quote(member_addr, safe='')}/memberConfig"
-    print(f"[hz_get_member_config] GET {url}", flush=True)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(url)
-    print(f"[hz_get_member_config] status={r.status_code} content-type={r.headers.get('content-type')} body={r.text[:500]!r}", flush=True)
-    r.raise_for_status()
-    # MC wraps the XML in a JSON string: the response body is `"<hazelcast ...>"`.
-    xml_str = json.loads(r.text)
-    root = ET.parse(io.BytesIO(xml_str.encode("utf-8"))).getroot()
-    return {"member": member_addr, "config": _xml_to_dict(root)}
-
-
 # ---------------------------------------------------------------------------
-# Log backend — raw bytes fetch
+# Tool definitions
 # ---------------------------------------------------------------------------
 
-def _fetch_raw_logs(member: str, since: int, until: int) -> bytes:
-    """Dispatch to the configured log backend."""
-    if LOG_BACKEND == "docker":
-        return _fetch_raw_logs_docker(member, since, until)
-    elif LOG_BACKEND == "files":
-        return _fetch_raw_logs_files(member, since, until)
-    return b""
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    member_list = ", ".join(MEMBERS)
 
+    if FILE_ACCESS_BACKEND == "none":
+        return []
 
-def _fetch_raw_logs_docker(container_name: str, since: int, until: int) -> bytes:
-    import docker
-    client = docker.from_env()
-    container = client.containers.get(container_name)
-    return container.logs(since=since, until=until, timestamps=True, stream=False)
+    backend_note = f"({FILE_ACCESS_BACKEND} backend)"
 
-
-def _fetch_raw_logs_files(member: str, since: int, until: int) -> bytes:
-    """
-    Read log content from files under LOG_DIR.
-
-    Searched paths (first match wins, all matching files are merged):
-      {LOG_DIR}/{member}.log
-      {LOG_DIR}/{member}/*.log
-      {LOG_DIR}/{member}*.log
-
-    Lines with Docker-format timestamps (YYYY-MM-DDTHH:MM:SS) are filtered to
-    the [since, until] window.  Lines without timestamps are included as-is.
-    """
-    patterns = [
-        os.path.join(LOG_DIR, f"{member}.log"),
-        os.path.join(LOG_DIR, member, "*.log"),
-        os.path.join(LOG_DIR, f"{member}*.log"),
+    return [
+        Tool(
+            name="hz_get_member_config",
+            description=(
+                "Read the Hazelcast configuration file directly from a member "
+                f"{backend_note} and return it as JSON. "
+                "Use this to verify CP subsystem settings: session TTL, "
+                "group size, missing-member auto-removal timeout, CPMap size limits, etc."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "member": {
+                        "type": "string",
+                        "description": (
+                            f"Member to query (e.g. 'hz1'). "
+                            f"Available: {member_list}"
+                        ),
+                    },
+                },
+                "required": ["member"],
+            },
+        ),
+        Tool(
+            name="hz_log_summary",
+            description=(
+                "Return per-member WARN and ERROR log line counts for a time window. "
+                "Very cheap (~50 tokens). Call this FIRST to identify which members have "
+                "issues before fetching full log lines with hz_get_logs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number", "description": "Window start — Unix timestamp"},
+                    "end":   {"type": "number", "description": "Window end   — Unix timestamp"},
+                },
+                "required": ["start", "end"],
+            },
+        ),
+        Tool(
+            name="hz_get_logs",
+            description=(
+                "Fetch structured log entries from Hazelcast members for a time window. "
+                f"Available members: {member_list}. "
+                "Returns compact JSON entries {ts, member, level, logger, msg}. "
+                "Stack traces are folded to the exception class + first cause line to save tokens. "
+                "Tips: use hz_log_summary first; specify only affected members; "
+                "pass keywords from Prometheus findings to filter further."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "start":    {"type": "number",  "description": "Window start — Unix timestamp"},
+                    "end":      {"type": "number",  "description": "Window end   — Unix timestamp"},
+                    "members":  {
+                        "type": "array", "items": {"type": "string"},
+                        "description": f"Members to query (default: all). Available: {member_list}",
+                    },
+                    "level":    {
+                        "type": "string",
+                        "enum": ["WARN", "ERROR", "INFO", "DEBUG"],
+                        "description": "Minimum log level to include (default: WARN)",
+                    },
+                    "keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Optional keywords — only lines containing at least one are returned",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum log entries to return (default: 100, max: 300)",
+                    },
+                },
+                "required": ["start", "end"],
+            },
+        ),
+        Tool(
+            name="hz_get_diagnostic_logs",
+            description=(
+                "Fetch Hazelcast diagnostic log snippets from a member "
+                f"{backend_note}. "
+                "Only available if diagnostics are enabled in hazelcast.xml "
+                "(hazelcast.diagnostics.enabled=true). Returns 'not available' otherwise. "
+                "Always keyword-filter to avoid returning large files."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "member":   {"type": "string",  "description": f"Target member. One of: {member_list}"},
+                    "start":    {"type": "number",  "description": "Window start — Unix timestamp"},
+                    "end":      {"type": "number",  "description": "Window end   — Unix timestamp"},
+                    "keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Keywords to filter diagnostic lines (strongly recommended)",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines to return (default: 100)",
+                    },
+                },
+                "required": ["member", "start", "end"],
+            },
+        ),
     ]
-    found: list[str] = []
-    for pattern in patterns:
-        found.extend(glob.glob(pattern))
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    paths = [p for p in found if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
 
-    lines: list[bytes] = []
-    for path in paths:
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    try:
+        if name == "hz_get_member_config":
+            result = await _get_member_config(arguments["member"])
+        elif name == "hz_log_summary":
+            result = await _log_summary(
+                float(arguments["start"]),
+                float(arguments["end"]),
+            )
+        elif name == "hz_get_logs":
+            result = await _get_logs(
+                start    = float(arguments["start"]),
+                end      = float(arguments["end"]),
+                members  = arguments.get("members") or MEMBERS,
+                level    = arguments.get("level", "WARN"),
+                keywords = [k.lower() for k in (arguments.get("keywords") or [])],
+                max_lines= min(int(arguments.get("max_lines") or 100), 300),
+            )
+        elif name == "hz_get_diagnostic_logs":
+            result = await _get_diagnostic_logs(
+                member   = arguments["member"],
+                keywords = [k.lower() for k in (arguments.get("keywords") or [])],
+                max_lines= int(arguments.get("max_lines") or 100),
+            )
+        else:
+            result = {"error": f"Unknown tool: {name}"}
+    except Exception as exc:
+        result = {"error": str(exc)}
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+async def _get_member_config(member: str) -> dict:
+    """
+    Read hazelcast.xml (or hazelcast.yaml) directly from the member using
+    the configured FILE_ACCESS_BACKEND.
+    """
+    name = _member_name(member)
+    if name not in MEMBERS:
+        return {"error": f"Unknown member: {name}. Available: {MEMBERS}"}
+
+    try:
+        paths = member_find_files(
+            name,
+            ["hazelcast.xml", "hazelcast.yaml", "hazelcast.yml"],
+        )
+    except Exception as exc:
+        return {"error": f"Could not locate config file: {exc}"}
+
+    if not paths:
+        return {
+            "error": "No hazelcast.xml / hazelcast.yaml found. "
+                     "Check the container/file layout or mount a config volume.",
+        }
+
+    config_path = paths[0]
+    try:
+        content = member_read_file(name, config_path).decode("utf-8", errors="replace")
+    except Exception as exc:
+        return {"error": f"Could not read {config_path}: {exc}"}
+
+    if config_path.endswith(".xml"):
         try:
-            with open(path, "rb") as f:
-                for raw in f:
-                    text = raw.decode("utf-8", errors="replace")
-                    m = _DOCKER_TS.match(text)
-                    if m:
-                        try:
-                            ts = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
-                            if not (since <= ts.timestamp() <= until):
-                                continue
-                        except Exception:
-                            pass
-                    lines.append(raw)
-        except Exception:
-            pass
-    return b"".join(lines)
+            root = ET.parse(io.BytesIO(content.encode("utf-8"))).getroot()
+            return {
+                "member": name,
+                "source": config_path,
+                "config": _xml_to_dict(root),
+            }
+        except ET.ParseError as exc:
+            return {"member": name, "source": config_path,
+                    "error": f"XML parse error: {exc}", "raw": content[:2000]}
 
-
-# ---------------------------------------------------------------------------
-# Log helpers
-# ---------------------------------------------------------------------------
-
-def _parse_line(raw: str, member: str) -> dict | None:
-    """
-    Parse a single Docker-timestamped Hazelcast log line into a compact dict.
-    Returns None for blank lines and pure stack-trace continuation lines.
-    """
-    m = _DOCKER_TS.match(raw)
-    if not m:
-        return None
-    ts, content = m.group(1), m.group(2)
-    content = content.rstrip()
-    if not content:
-        return None
-
-    lm = _LEVEL_RE.search(content)
-    level = lm.group(1) if lm else "INFO"
-
-    lm2 = _LOGGER_RE.search(content)
-    if lm2:
-        logger  = lm2.group(1)
-        parts   = logger.split(".")
-        short   = ".".join(p[0] for p in parts[:-1]) + "." + parts[-1] if len(parts) > 1 else logger
-        message = lm2.group(2)
-    else:
-        short   = ""
-        message = content
-
-    return {"ts": ts, "member": member, "level": level, "logger": short, "msg": message}
+    # YAML — return as raw text; LLM can read it directly
+    return {"member": name, "source": config_path, "config_yaml": content}
 
 
 async def _log_summary(start: float, end: float) -> dict:
@@ -382,7 +443,7 @@ async def _log_summary(start: float, end: float) -> dict:
     errors: dict = {}
     for member in MEMBERS:
         try:
-            raw = _fetch_raw_logs(member, since, until)
+            raw = member_read_logs(member, since, until)
             lines = raw.split(b"\n")
             warn  = sum(1 for l in lines if b"] WARN" in l or b"] WARNING" in l)
             error = sum(1 for l in lines if b"] ERROR" in l)
@@ -391,7 +452,7 @@ async def _log_summary(start: float, end: float) -> dict:
         except Exception as exc:
             errors[member] = str(exc)
 
-    result: dict = {"backend": LOG_BACKEND, "window": {"start": _fmt_ts(start), "end": _fmt_ts(end)}, "members": summary}
+    result: dict = {"backend": FILE_ACCESS_BACKEND, "window": {"start": _fmt_ts(start), "end": _fmt_ts(end)}, "members": summary}
     if errors:
         result["errors"] = errors
     return result
@@ -415,7 +476,7 @@ async def _get_logs(
             errors[member] = "unknown member"
             continue
         try:
-            raw = _fetch_raw_logs(member, since, until)
+            raw = member_read_logs(member, since, until)
             lines = raw.decode("utf-8", errors="replace").splitlines()
             last_entry: dict | None = None
             stack_count = 0
@@ -452,7 +513,7 @@ async def _get_logs(
             errors[member] = str(exc)
 
     result: dict = {
-        "backend": LOG_BACKEND,
+        "backend": FILE_ACCESS_BACKEND,
         "window": {"start": _fmt_ts(start), "end": _fmt_ts(end)},
         "filters": {"level": level, "keywords": keywords or None, "max_lines": max_lines},
         "returned": len(entries),
@@ -465,42 +526,33 @@ async def _get_logs(
 
 async def _get_diagnostic_logs(
     member: str,
-    start: float,
-    end: float,
     keywords: list[str],
     max_lines: int,
 ) -> dict:
-    if member not in MEMBERS:
-        return {"error": f"Unknown member: {member}. Available: {MEMBERS}"}
+    name = _member_name(member)
+    if name not in MEMBERS:
+        return {"error": f"Unknown member: {name}. Available: {MEMBERS}"}
 
-    import docker
-    client = docker.from_env()
     try:
-        container = client.containers.get(member)
+        diag_files = member_find_files(name, ["diagnostics*.log"])
     except Exception as exc:
         return {"error": str(exc)}
 
-    find_result = container.exec_run(
-        "find /opt/hazelcast /data -name 'diagnostics*.log' -type f 2>/dev/null",
-        demux=True,
-    )
-    stdout = (find_result.output[0] or b"").decode("utf-8", errors="replace").strip()
-    if not stdout:
+    if not diag_files:
         return {
             "available": False,
             "message": "No diagnostic log files found. Enable diagnostics with "
                        "-Dhazelcast.diagnostics.enabled=true in JAVA_OPTS.",
         }
 
-    diag_files = stdout.splitlines()
-    start_str = _fmt_ts(start)
-    end_str   = _fmt_ts(end)
     collected: list[str] = []
     files_read: list[str] = []
 
     for path in diag_files[:3]:
-        cat_result = container.exec_run(f"cat {path}", demux=True)
-        content = (cat_result.output[0] or b"").decode("utf-8", errors="replace")
+        try:
+            content = member_read_file(name, path).decode("utf-8", errors="replace")
+        except Exception:
+            continue
         files_read.append(path)
         for line in content.splitlines():
             if len(collected) >= max_lines:
@@ -517,8 +569,96 @@ async def _get_diagnostic_logs(
     }
 
 
+def _parse_line(raw: str, member: str) -> dict | None:
+    """
+    Parse a single Docker-timestamped Hazelcast log line into a compact dict.
+    Returns None for blank lines and pure stack-trace continuation lines.
+    """
+    m = _DOCKER_TS.match(raw)
+    if not m:
+        return None
+    ts, content = m.group(1), m.group(2)
+    content = content.rstrip()
+    if not content:
+        return None
+
+    lm = _LEVEL_RE.search(content)
+    level = lm.group(1) if lm else "INFO"
+
+    lm2 = _LOGGER_RE.search(content)
+    if lm2:
+        logger  = lm2.group(1)
+        parts   = logger.split(".")
+        short   = ".".join(p[0] for p in parts[:-1]) + "." + parts[-1] if len(parts) > 1 else logger
+        message = lm2.group(2)
+    else:
+        short   = ""
+        message = content
+
+    return {"ts": ts, "member": member, "level": level, "logger": short, "msg": message}
+
+
 def _fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Backend health check
+# ---------------------------------------------------------------------------
+
+def _check_file_access_backend() -> dict:
+    """
+    Verify the configured file access backend is actually accessible.
+    Returns a dict with ok, message, members_found, members_missing.
+    """
+    if FILE_ACCESS_BACKEND == "none":
+        return {
+            "ok": False,
+            "message": "File access disabled (FILE_ACCESS_BACKEND=none)",
+            "members_found": [],
+            "members_missing": [],
+        }
+
+    if FILE_ACCESS_BACKEND == "docker":
+        try:
+            import docker as _docker
+            client = _docker.from_env()
+            found, missing = [], []
+            for m in MEMBERS:
+                try:
+                    client.containers.get(m)
+                    found.append(m)
+                except Exception:
+                    missing.append(m)
+            msg = f"{len(found)}/{len(MEMBERS)} containers accessible"
+            if missing:
+                msg += f"; missing: {', '.join(missing)}"
+            return {"ok": len(found) > 0, "message": msg,
+                    "members_found": found, "members_missing": missing}
+        except Exception as exc:
+            return {"ok": False, "message": f"Docker socket unavailable: {exc}",
+                    "members_found": [], "members_missing": MEMBERS}
+
+    if FILE_ACCESS_BACKEND == "files":
+        if not os.path.isdir(FILE_DIR):
+            return {"ok": False, "message": f"File directory not found: {FILE_DIR}",
+                    "members_found": [], "members_missing": MEMBERS}
+        found, missing = [], []
+        for m in MEMBERS:
+            patterns = [
+                os.path.join(FILE_DIR, f"{m}.log"),
+                os.path.join(FILE_DIR, m, "*.log"),
+                os.path.join(FILE_DIR, f"{m}*.log"),
+            ]
+            (found if any(glob.glob(p) for p in patterns) else missing).append(m)
+        msg = f"{len(found)}/{len(MEMBERS)} members accessible"
+        if missing:
+            msg += f"; missing: {', '.join(missing)}"
+        return {"ok": len(found) > 0, "message": msg,
+                "members_found": found, "members_missing": missing}
+
+    return {"ok": False, "message": f"Unknown backend: {FILE_ACCESS_BACKEND}",
+            "members_found": [], "members_missing": MEMBERS}
 
 
 # ---------------------------------------------------------------------------
@@ -543,11 +683,39 @@ async def handle_sse(request: Request) -> _NullResponse:
     return _NullResponse()
 
 
+async def handle_config_update(request: Request):
+    global MC_URL, MC_CLUSTER, MEMBERS, FILE_ACCESS_BACKEND, FILE_DIR
+    body = await request.json()
+    if "mc_url"               in body and body["mc_url"]:
+        MC_URL               = body["mc_url"].rstrip("/")
+    if "mc_cluster"           in body and body["mc_cluster"]:
+        MC_CLUSTER           = body["mc_cluster"]
+    if "members"              in body and body["members"]:
+        MEMBERS              = [m.strip() for m in body["members"].split(",") if m.strip()]
+    if "file_access_backend"  in body and body["file_access_backend"]:
+        FILE_ACCESS_BACKEND  = body["file_access_backend"].lower()
+    if "file_dir"             in body and body["file_dir"]:
+        FILE_DIR             = body["file_dir"]
+    return JSONResponse({"ok": True})
+
+
+async def handle_status(_: Request):
+    backend_status = _check_file_access_backend()
+    return JSONResponse({
+        "file_access_backend": FILE_ACCESS_BACKEND,
+        "members":             MEMBERS,
+        "file_dir":            FILE_DIR if FILE_ACCESS_BACKEND == "files" else None,
+        **backend_status,
+    })
+
+
 starlette_app = Starlette(
     routes=[
         Route("/sse",      endpoint=handle_sse),
         Mount("/messages", app=sse_transport.handle_post_message),
         Route("/health",   endpoint=lambda r: Response("ok")),
+        Route("/status",   endpoint=handle_status),
+        Route("/config",   endpoint=handle_config_update, methods=["POST"]),
     ]
 )
 

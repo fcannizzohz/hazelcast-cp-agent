@@ -481,6 +481,20 @@
     }
     .cfg-field input:focus { border-color: var(--accent); }
     .cfg-field input[readonly] { color: var(--muted); cursor: default; }
+    .cfg-field select {
+      width: 100%;
+      background: #12151f;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text);
+      padding: 7px 10px;
+      font-size: 13px;
+      font-family: var(--mono);
+      outline: none;
+      cursor: pointer;
+    }
+    .cfg-field select:focus { border-color: var(--accent); }
+    .cfg-field select option { background: var(--surface); }
 
     .cfg-section-title {
       font-size: 10px;
@@ -593,6 +607,9 @@
     <div class="dep-item" title="Hazelcast MCP server">
       <div class="dep-dot" id="dot-hz-mcp"></div><span>HZ MCP</span>
     </div>
+    <div class="dep-item" title="File access">
+      <div class="dep-dot" id="dot-logs"></div><span>Files</span>
+    </div>
   </div>
   <button id="cfg-btn" title="Configure endpoints">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -627,6 +644,23 @@
         <input type="url" id="cfg-mc-url" placeholder="http://host.docker.internal:8080" spellcheck="false" />
       </div>
 
+      <div class="cfg-field">
+        <label>MC CLUSTER</label>
+        <input type="text" id="cfg-mc-cluster" placeholder="dev" spellcheck="false" />
+      </div>
+
+      <div class="cfg-field">
+        <label>HZ MEMBER ADDRS <span style="font-weight:400;color:var(--muted)">(host:port, comma-separated)</span></label>
+        <input type="text" id="cfg-hz-member-addrs" placeholder="host.docker.internal:5701,…" spellcheck="false" />
+      </div>
+
+      <div class="cfg-section-title" style="margin-top:4px">Cluster</div>
+
+      <div class="cfg-field">
+        <label>HZ MEMBERS <span style="font-weight:400;color:var(--muted)">(comma-separated)</span></label>
+        <input type="text" id="cfg-hz-members" placeholder="hz1,hz2,hz3,hz4,hz5" spellcheck="false" />
+      </div>
+
       <div class="cfg-section-title" style="margin-top:4px">MCP servers</div>
 
       <div class="cfg-field">
@@ -637,6 +671,27 @@
       <div class="cfg-field">
         <label><div class="dep-dot" id="cfg-dot-hz-mcp"></div> HAZELCAST MCP SERVER</label>
         <input type="text" id="cfg-hz-mcp" readonly tabindex="-1" />
+      </div>
+
+      <div class="cfg-section-title" style="margin-top:4px">File access</div>
+
+      <div class="cfg-field">
+        <label><div class="dep-dot" id="cfg-dot-logs"></div> BACKEND</label>
+        <select id="cfg-file-backend">
+          <option value="docker">docker</option>
+          <option value="files">files</option>
+          <option value="none">none</option>
+        </select>
+      </div>
+
+      <div class="cfg-field" id="cfg-file-dir-field" style="display:none">
+        <label>FILE DIRECTORY</label>
+        <input type="text" id="cfg-file-dir" placeholder="/logs" spellcheck="false" />
+      </div>
+
+      <div class="cfg-field">
+        <label>FILE ACCESS STATUS</label>
+        <input type="text" id="cfg-file-status" readonly tabindex="-1" placeholder="—" />
       </div>
 
     </div>
@@ -741,13 +796,35 @@
 </div>
 
 <script>
+  // ── Scoped localStorage — keyed by a hash of the MC URL ──────────────────
+  // Each Management Center endpoint gets its own storage namespace so configs
+  // for different systems never interfere when the same browser is reused.
+  let _scope = 'default';
+
+  function _scopeHash(url) {
+    // djb2-variant: deterministic, short, readable in devtools
+    let h = 5381;
+    for (let i = 0; i < url.length; i++) h = (h * 33 ^ url.charCodeAt(i)) >>> 0;
+    return h.toString(36);
+  }
+
+  function _setScope(mcUrl) {
+    _scope = mcUrl ? _scopeHash(mcUrl.toLowerCase().replace(/\/+$/, '')) : 'default';
+  }
+
+  function cfgKey()     { return `cp_agent_config:${_scope}`; }
+  function contextKey() { return `cp_agent_context:${_scope}`; }
+
   // ── Operator context (localStorage) ──────────────────────────────────────
-  const CONTEXT_KEY = 'cp_agent_context';
+  // Populated after _setScope() is called with the server's MC URL.
   let contextItems = [];
-  try { contextItems = JSON.parse(localStorage.getItem(CONTEXT_KEY) || '[]'); } catch {}
+
+  function loadContextItems() {
+    try { contextItems = JSON.parse(localStorage.getItem(contextKey()) || '[]'); } catch { contextItems = []; }
+  }
 
   function saveContext() {
-    localStorage.setItem(CONTEXT_KEY, JSON.stringify(contextItems));
+    localStorage.setItem(contextKey(), JSON.stringify(contextItems));
   }
 
   function renderContext() {
@@ -789,16 +866,20 @@
   renderContext();
 
   // ── Config modal ─────────────────────────────────────────────────────────
-  const CFG_KEY = 'cp_agent_config';
-
   function loadSavedConfig() {
-    try { return JSON.parse(localStorage.getItem(CFG_KEY) || '{}'); } catch { return {}; }
+    try { return JSON.parse(localStorage.getItem(cfgKey()) || '{}'); } catch { return {}; }
   }
 
   function openCfgModal() {
     const saved = loadSavedConfig();
     document.getElementById('cfg-prom-url').value = saved.promUrl || promUrl;
     document.getElementById('cfg-mc-url').value   = saved.mcUrl   || mcUrl;
+    document.getElementById('cfg-mc-cluster').value      = saved.mcCluster     || mcCluster;
+    document.getElementById('cfg-hz-member-addrs').value = saved.hzMemberAddrs || hzMemberAddrs;
+    document.getElementById('cfg-hz-members').value      = saved.hzMembers     || hzMembers;
+    const savedBackend = saved.fileBackend || document.getElementById('cfg-file-backend').value;
+    document.getElementById('cfg-file-backend').value = savedBackend;
+    document.getElementById('cfg-file-dir').value    = saved.fileDir || document.getElementById('cfg-file-dir').value;
     document.getElementById('cfg-saved-badge').classList.remove('show');
     document.getElementById('cfg-backdrop').classList.add('open');
     setTimeout(() => document.getElementById('cfg-prom-url').focus(), 50);
@@ -808,13 +889,55 @@
     document.getElementById('cfg-backdrop').classList.remove('open');
   }
 
-  function applyCfg() {
-    const newPromUrl = document.getElementById('cfg-prom-url').value.trim();
-    const newMcUrl   = document.getElementById('cfg-mc-url').value.trim();
+  async function applyCfg() {
+    const newPromUrl         = document.getElementById('cfg-prom-url').value.trim();
+    const newMcUrl           = document.getElementById('cfg-mc-url').value.trim();
+    const newMcCluster       = document.getElementById('cfg-mc-cluster').value.trim();
+    const newHzMemberAddrs   = document.getElementById('cfg-hz-member-addrs').value.trim();
+    const newHzMembers       = document.getElementById('cfg-hz-members').value.trim();
+    const newFileBackend     = document.getElementById('cfg-file-backend').value;
+    const newFileDir         = document.getElementById('cfg-file-dir').value.trim();
+
+    // Update in-memory state
+    if (newPromUrl)       promUrl       = newPromUrl;
+    if (newMcUrl)         mcUrl         = newMcUrl;
+    if (newMcCluster)     mcCluster     = newMcCluster;
+    if (newHzMemberAddrs) hzMemberAddrs = newHzMemberAddrs;
+    if (newHzMembers)     hzMembers     = newHzMembers;
+
+    // Persist to localStorage
     const saved = loadSavedConfig();
-    if (newPromUrl) { promUrl = newPromUrl; saved.promUrl = newPromUrl; }
-    if (newMcUrl)   { mcUrl   = newMcUrl;   saved.mcUrl   = newMcUrl;   }
-    localStorage.setItem(CFG_KEY, JSON.stringify(saved));
+    Object.assign(saved, {
+      promUrl: newPromUrl || saved.promUrl,
+      mcUrl:   newMcUrl   || saved.mcUrl,
+      mcCluster:     newMcCluster     || saved.mcCluster,
+      hzMemberAddrs: newHzMemberAddrs || saved.hzMemberAddrs,
+      hzMembers:     newHzMembers     || saved.hzMembers,
+      fileBackend:   newFileBackend,
+      fileDir:       newFileDir       || saved.fileDir,
+    });
+    // If MC URL changed, move to the new scope before saving
+    const targetMcUrl = newMcUrl || mcUrl;
+    _setScope(targetMcUrl);
+    localStorage.setItem(cfgKey(), JSON.stringify(saved));
+
+    // Push to backend
+    try {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prometheus_url:       newPromUrl       || undefined,
+          mc_url:               newMcUrl         || undefined,
+          mc_cluster:           newMcCluster     || undefined,
+          hz_member_addrs:      newHzMemberAddrs || undefined,
+          members:              newHzMembers     || undefined,
+          file_access_backend:  newFileBackend   || undefined,
+          file_dir:             newFileDir       || undefined,
+        }),
+      });
+    } catch {}
+
     document.getElementById('cfg-saved-badge').classList.add('show');
     checkPromHealth();
     setTimeout(closeCfgModal, 600);
@@ -868,15 +991,27 @@
   applyPreset(60);
 
   // ── Load server config ────────────────────────────────────────────────────
-  let promUrl = '';
-  let mcUrl   = '';
+  let promUrl       = '';
+  let mcUrl         = '';
+  let mcCluster     = '';
+  let hzMemberAddrs = '';
+  let hzMembers     = '';
   fetch('/api/config')
     .then(r => r.json())
     .then(cfg => {
-      // Apply saved overrides, fall back to server defaults
+      // Set scope from server's MC URL, then load scoped config
+      _setScope(cfg.mc_url || '');
       const saved = loadSavedConfig();
-      promUrl = saved.promUrl || cfg.prometheus_url || '';
-      mcUrl   = saved.mcUrl   || cfg.mc_url         || '';
+      // Saved MC URL may point to a different scope — re-scope if overridden
+      if (saved.mcUrl && saved.mcUrl !== cfg.mc_url) _setScope(saved.mcUrl);
+      promUrl       = saved.promUrl       || cfg.prometheus_url  || '';
+      mcUrl         = saved.mcUrl         || cfg.mc_url          || '';
+      mcCluster     = saved.mcCluster     || cfg.mc_cluster      || '';
+      hzMemberAddrs = saved.hzMemberAddrs || cfg.hz_member_addrs || '';
+      hzMembers     = saved.hzMembers     || '';
+      // Reload operator context for this scope
+      loadContextItems();
+      renderContext();
       // Populate read-only MCP info fields
       const promMcpUrl = cfg.prom_mcp_url || window.location.origin.replace(/:\d+$/, ':8001');
       const hzMcpUrl   = cfg.hz_mcp_url   || window.location.origin.replace(/:\d+$/, ':8002');
@@ -891,8 +1026,11 @@
     })
     .catch(() => {
       const saved = loadSavedConfig();
-      if (saved.promUrl) promUrl = saved.promUrl;
-      if (saved.mcUrl)   mcUrl   = saved.mcUrl;
+      if (saved.promUrl)       promUrl       = saved.promUrl;
+      if (saved.mcUrl)         mcUrl         = saved.mcUrl;
+      if (saved.mcCluster)     mcCluster     = saved.mcCluster;
+      if (saved.hzMemberAddrs) hzMemberAddrs = saved.hzMemberAddrs;
+      if (saved.hzMembers)     hzMembers     = saved.hzMembers;
     });
 
   // ── Load models ───────────────────────────────────────────────────────────
@@ -938,19 +1076,39 @@
     } catch {}
 
     const none = { ok: false, message: 'No response' };
-    const prom    = d.prometheus        || none;
-    const mc      = d.management_center || none;
-    const promMcp = d.prom_mcp          || none;
-    const hzMcp   = d.hz_mcp            || none;
+    const prom      = d.prometheus        || none;
+    const mc        = d.management_center || none;
+    const promMcp   = d.prom_mcp          || none;
+    const hzMcp     = d.hz_mcp            || none;
+    const logAccess = d.log_access        || none;
 
-    setDot('dot-prom',     prom.ok,    `Prometheus: ${prom.message}`);
-    setDot('dot-mc',       mc.ok,      `Management Center: ${mc.message}`);
-    setDot('dot-prom-mcp', promMcp.ok, `Prom MCP: ${promMcp.message}`);
-    setDot('dot-hz-mcp',   hzMcp.ok,   `HZ MCP: ${hzMcp.message}`);
-    setDot('cfg-dot-prom',     prom.ok,    prom.message);
-    setDot('cfg-dot-mc',       mc.ok,      mc.message);
-    setDot('cfg-dot-prom-mcp', promMcp.ok, promMcp.message);
-    setDot('cfg-dot-hz-mcp',   hzMcp.ok,   hzMcp.message);
+    setDot('dot-prom',     prom.ok,      `Prometheus: ${prom.message}`);
+    setDot('dot-mc',       mc.ok,        `Management Center: ${mc.message}`);
+    setDot('dot-prom-mcp', promMcp.ok,   `Prom MCP: ${promMcp.message}`);
+    setDot('dot-hz-mcp',   hzMcp.ok,     `HZ MCP: ${hzMcp.message}`);
+    setDot('dot-logs',     logAccess.ok, `Logs: ${logAccess.message}`);
+    setDot('cfg-dot-prom',     prom.ok,      prom.message);
+    setDot('cfg-dot-mc',       mc.ok,        mc.message);
+    setDot('cfg-dot-prom-mcp', promMcp.ok,   promMcp.message);
+    setDot('cfg-dot-hz-mcp',   hzMcp.ok,     hzMcp.message);
+    setDot('cfg-dot-logs',     logAccess.ok, logAccess.message);
+
+    // Populate file access info fields
+    if (d.log_access) {
+      const la = d.log_access;
+      // Update backend select only if user hasn't edited it
+      if (la.file_access_backend) document.getElementById('cfg-file-backend').value = la.file_access_backend;
+      // Show/hide file dir field
+      const dirField = document.getElementById('cfg-file-dir-field');
+      dirField.style.display = la.file_dir ? '' : 'none';
+      if (la.file_dir) document.getElementById('cfg-file-dir').value = la.file_dir;
+      // File access status (read-only)
+      const found   = (la.members_found   || []).length;
+      const missing = (la.members_missing || []);
+      let statusTxt = `${found}/${(la.members || []).length} members accessible`;
+      if (missing.length) statusTxt += `; missing: ${missing.join(', ')}`;
+      document.getElementById('cfg-file-status').value = statusTxt;
+    }
   }
   setInterval(checkPromHealth, 15_000);
 

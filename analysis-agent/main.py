@@ -15,6 +15,7 @@ import json
 import os
 
 import httpx
+from dotenv import load_dotenv
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -29,9 +30,14 @@ from llm import AVAILABLE_MODELS, analyse
 from prom import PrometheusClient, choose_step
 from queries import INSTANT_QUERIES, RANGE_QUERIES
 
+load_dotenv()
+
 PROMETHEUS_URL  = os.environ.get("PROMETHEUS_URL",  "http://localhost:9090")
 PROM_MCP_URL    = os.environ.get("MCP_SERVER_URL",  "http://localhost:8001")
 HZ_MCP_URL      = os.environ.get("MCP_HZ_URL",      "http://localhost:8002")
+
+# Runtime config — overrides env vars; updated via POST /api/config
+_cfg: dict = {}
 
 app = FastAPI(title="CP Subsystem AI Agent")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -76,13 +82,44 @@ async def models():
 
 @app.get("/api/config")
 async def config():
-    from cluster import MC_URL
+    from cluster import MC_URL as DEFAULT_MC_URL, MC_CLUSTER as DEFAULT_MC_CLUSTER, HZ_MEMBER_ADDRS as DEFAULT_HZ_MEMBER_ADDRS
     return {
-        "prometheus_url": PROMETHEUS_URL,
-        "mc_url":         MC_URL,
-        "prom_mcp_url":   PROM_MCP_URL,
-        "hz_mcp_url":     HZ_MCP_URL,
+        "prometheus_url":  _cfg.get("prometheus_url",  PROMETHEUS_URL),
+        "mc_url":          _cfg.get("mc_url",          DEFAULT_MC_URL),
+        "mc_cluster":      _cfg.get("mc_cluster",      DEFAULT_MC_CLUSTER),
+        "hz_member_addrs": _cfg.get("hz_member_addrs", DEFAULT_HZ_MEMBER_ADDRS),
+        "prom_mcp_url":    PROM_MCP_URL,
+        "hz_mcp_url":      HZ_MCP_URL,
     }
+
+
+@app.post("/api/config")
+async def update_config(request: Request):
+    """
+    Accept runtime config overrides from the UI.
+    Stores values in _cfg (in-memory) and propagates relevant settings
+    to the MCP servers.
+    """
+    body = await request.json()
+    updatable = {
+        "prometheus_url", "mc_url", "mc_cluster",
+        "hz_member_addrs", "members", "file_access_backend", "file_dir",
+    }
+    for k, v in body.items():
+        if k in updatable and v is not None:
+            _cfg[k] = v
+
+    # Propagate hz-related config to hz-mcp-server
+    hz_payload = {k: v for k, v in body.items()
+                  if k in {"mc_url", "mc_cluster", "members", "file_access_backend", "file_dir"} and v}
+    if hz_payload:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                await client.post(f"{HZ_MCP_URL}/config", json=hz_payload)
+        except Exception:
+            pass  # MCP server unreachable; UI will show red dot
+
+    return {"ok": True, "config": {k: _cfg[k] for k in _cfg}}
 
 
 @app.get("/api/health")
@@ -95,6 +132,8 @@ async def health(
     actually uses. The browser never reaches backend services directly.
     """
     from cluster import MC_URL as DEFAULT_MC_URL
+
+    resolved_mc = mc_url or _cfg.get("mc_url") or DEFAULT_MC_URL
 
     async def _check_url(url: str) -> dict:
         try:
@@ -117,18 +156,33 @@ async def health(
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
-    resolved_mc = mc_url or DEFAULT_MC_URL
-    prometheus, management_center, prom_mcp, hz_mcp = await asyncio.gather(
+    async def _get_hz_status(url: str) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(url)
+            if r.status_code < 500:
+                return r.json()
+            return {"ok": False, "message": f"HTTP {r.status_code}"}
+        except httpx.ConnectError:
+            return {"ok": False, "message": "Connection refused"}
+        except httpx.TimeoutException:
+            return {"ok": False, "message": "Timed out"}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    prometheus, management_center, prom_mcp, hz_mcp, log_access = await asyncio.gather(
         _check_prometheus(prometheus_url),
         _check_url(resolved_mc),
         _check_url(f"{PROM_MCP_URL}/health"),
         _check_url(f"{HZ_MCP_URL}/health"),
+        _get_hz_status(f"{HZ_MCP_URL}/status"),
     )
     return {
         "prometheus":        prometheus,
         "management_center": management_center,
         "prom_mcp":          prom_mcp,
         "hz_mcp":            hz_mcp,
+        "log_access":        log_access,
     }
 
 
@@ -216,7 +270,10 @@ async def analyse_endpoint(
             query_meta=query_meta,
         )
 
-        cluster_context = await derive_context(prom)
+        cluster_context = await derive_context(
+            prom,
+            hz_member_addrs = _cfg.get("hz_member_addrs", ""),
+        )
 
         try:
             ctx_list: list[str] = json.loads(user_context) if user_context else []

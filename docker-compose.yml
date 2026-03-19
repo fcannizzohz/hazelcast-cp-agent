@@ -37,18 +37,18 @@ services:
       MC_URL:      ${MC_URL:-http://host.docker.internal:8080}
       MC_CLUSTER:  ${MC_CLUSTER:-dev}
       PORT:        "8002"
-      # LOG_BACKEND selects the log source:
-      #   docker  (default) — reads container logs via Docker socket
-      #   files             — reads log files from LOG_DIR (mount below)
-      #   none              — disables all log tools
-      LOG_BACKEND: ${LOG_BACKEND:-docker}
-      LOG_DIR:     ${LOG_DIR:-/logs}
+      # FILE_ACCESS_BACKEND selects how logs and config are read from members:
+      #   docker  (default) — reads via Docker socket (logs + container filesystem)
+      #   files             — reads from FILE_DIR/{member}/ on the local filesystem
+      #   none              — disables all file access tools
+      FILE_ACCESS_BACKEND: ${FILE_ACCESS_BACKEND:-docker}
+      FILE_DIR:            ${FILE_DIR:-/logs}
     volumes:
       # docker backend: mount Docker socket (read-only)
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # files backend: mount a host directory containing {member}.log files
-      # Uncomment and set LOG_DIR_HOST in .env, or override here:
-      # - ${LOG_DIR_HOST:-/dev/null}:/logs:ro
+      # files backend: mount a host directory containing {member}/ subdirs with logs/config
+      # Uncomment and set FILE_DIR_HOST in .env, or override here:
+      # - ${FILE_DIR_HOST:-/dev/null}:/logs:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

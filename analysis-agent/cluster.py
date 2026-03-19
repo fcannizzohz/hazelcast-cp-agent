@@ -3,9 +3,11 @@ Cluster context — describes the topology and workload roles of this CP cluster
 
 STATIC_CONTEXT is the authoritative fallback.  derive_context() enriches it
 at analysis time by querying Prometheus for live values (member list, group
-list, group size) and fetches the CP subsystem config from Management Center.
-Group roles cannot be inferred from metrics alone, so they always come from
-STATIC_CONTEXT.
+list, group size).  Group roles cannot be inferred from metrics alone, so
+they always come from STATIC_CONTEXT.
+
+CP subsystem config is not fetched here — use the hz_get_member_config MCP
+tool during agentic chat to read it directly from the container.
 
 Environment:
   MC_URL      Management Center base URL  default: http://host.docker.internal:8080
@@ -14,15 +16,14 @@ Environment:
 
 from __future__ import annotations
 
-import io
-import json
 import os
-import xml.etree.ElementTree as ET
-from urllib.parse import quote
 
 import httpx
+from dotenv import load_dotenv
 
 from prom import PrometheusClient
+
+load_dotenv()
 
 MC_URL          = os.environ.get("MC_URL",          "http://host.docker.internal:8080").rstrip("/")
 MC_CLUSTER      = os.environ.get("MC_CLUSTER",      "dev")
@@ -57,41 +58,10 @@ STATIC_CONTEXT: dict = {
 
 
 # ---------------------------------------------------------------------------
-# Management Center config helpers
+# Cluster health helper
 # ---------------------------------------------------------------------------
 
-def _xml_to_dict(element: ET.Element) -> dict | str | None:
-    """Recursively convert an XML element to a plain Python dict / str."""
-    tag = element.tag.split("}", 1)[1] if "}" in element.tag else element.tag
-    attrib = dict(element.attrib)
-    children = list(element)
-    text = (element.text or "").strip()
-
-    if not children:
-        if attrib:
-            node = dict(attrib)
-            if text:
-                node["_value"] = text
-            return node
-        return text or None
-
-    child_map: dict = {}
-    for child in children:
-        child_tag = child.tag.split("}", 1)[1] if "}" in child.tag else child.tag
-        child_val = _xml_to_dict(child)
-        if child_tag in child_map:
-            if not isinstance(child_map[child_tag], list):
-                child_map[child_tag] = [child_map[child_tag]]
-            child_map[child_tag].append(child_val)
-        else:
-            child_map[child_tag] = child_val
-
-    if attrib:
-        child_map.update(attrib)
-    return child_map
-
-
-async def _fetch_cluster_health(members: list[str]) -> dict:
+async def _fetch_cluster_health(members: list[str], hz_member_addrs: str = "") -> dict:
     """
     Call the Hazelcast REST health endpoint on each CP member and return a
     dict of {addr: health_result}.  Unreachable members are recorded as
@@ -101,11 +71,11 @@ async def _fetch_cluster_health(members: list[str]) -> dict:
     Response: {"nodeState":"ACTIVE","clusterState":"ACTIVE",
                "clusterSafe":true,"migrationQueueSize":0,"clusterSize":N}
 
-    Addresses are taken from HZ_MEMBER_ADDRS (comma-separated host:port) when set,
+    Addresses are taken from hz_member_addrs (comma-separated host:port) when set,
     otherwise constructed from the members list using port 5701.
     """
-    if HZ_MEMBER_ADDRS:
-        addrs = [a.strip() for a in HZ_MEMBER_ADDRS.split(",") if a.strip()]
+    if hz_member_addrs:
+        addrs = [a.strip() for a in hz_member_addrs.split(",") if a.strip()]
     else:
         addrs = [f"{m.split(':')[0]}:5701" for m in members]
 
@@ -123,35 +93,15 @@ async def _fetch_cluster_health(members: list[str]) -> dict:
     return results
 
 
-async def _fetch_cp_subsystem_config(member: str) -> dict:
-    """
-    Fetch member config from MC and return only the cp-subsystem section as a dict.
-    Returns {} on any failure (config is optional context enrichment).
-    """
-    try:
-        member_addr = member if ":" in member else f"{member}:5701"
-        url = (
-            f"{MC_URL}/api/clusters/{MC_CLUSTER}"
-            f"/members/{quote(member_addr, safe='')}/memberConfig"
-        )
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-        xml_str = json.loads(r.text)
-        root = ET.parse(io.BytesIO(xml_str.encode("utf-8"))).getroot()
-        cp_el = root.find("cp-subsystem")
-        if cp_el is None:
-            return {}
-        return _xml_to_dict(cp_el) or {}
-    except Exception:
-        return {}
-
-
 # ---------------------------------------------------------------------------
 # Dynamic derivation
 # ---------------------------------------------------------------------------
 
-async def derive_context(prom: PrometheusClient) -> dict:
+async def derive_context(
+    prom: PrometheusClient,
+    *,
+    hz_member_addrs: str = "",
+) -> dict:
     """
     Query Prometheus to derive what can be observed at runtime, then merge
     with STATIC_CONTEXT (static values win for group_roles which are not
@@ -221,15 +171,18 @@ async def derive_context(prom: PrometheusClient) -> dict:
     except Exception:
         pass
 
-    # ── CP subsystem config from Management Center ────────────────────────
-    first_member = ctx["cp_members"][0] if ctx.get("cp_members") else STATIC_CONTEXT["cp_members"][0]
-    cp_config = await _fetch_cp_subsystem_config(first_member)
-    if cp_config:
-        ctx["cp_subsystem_config"] = cp_config
-
     # ── Hazelcast REST health check (all CP members) ──────────────────────
-    health = await _fetch_cluster_health(ctx.get("cp_members", STATIC_CONTEXT["cp_members"]))
-    if health:
+    # Only included when HZ_MEMBER_ADDRS is explicitly configured, or when at
+    # least one member responded successfully — avoids injecting a wall of
+    # connection errors into the LLM context when the agent runs in a decoupled
+    # network and the derived hz1:5701 addresses are simply not reachable.
+    effective_hz_member_addrs = hz_member_addrs or HZ_MEMBER_ADDRS
+    if effective_hz_member_addrs:
+        health = await _fetch_cluster_health(ctx.get("cp_members", STATIC_CONTEXT["cp_members"]), effective_hz_member_addrs)
         ctx["cluster_health"] = health
+    else:
+        health = await _fetch_cluster_health(ctx.get("cp_members", STATIC_CONTEXT["cp_members"]), effective_hz_member_addrs)
+        if any("error" not in v for v in health.values()):
+            ctx["cluster_health"] = health
 
     return ctx
